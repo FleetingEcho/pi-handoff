@@ -6,7 +6,7 @@ argument-hint: "What will the next session be used for?"
 
 Write a handoff document summarising the current conversation so a fresh agent can continue the work.
 
-The pi-handoff extension already auto-maintains one for this working directory (read it first). It lives **outside the project**, in a per-project directory under `~/.pi/pi-handoff/` named after this directory's absolute path — run `/pi-handoff status` to print the exact path, then read `<store>/HANDOFF.md`.
+The pi-handoff extension already auto-maintains one for this working directory (read it first). It lives **outside the project**, in a per-project directory under `~/.pi/agent/pi-handoff/` named after this directory's absolute path — run `/pi-handoff status` to print the exact path, then read `<store>/HANDOFF.md`.
 
 Do **not** overwrite that file — the extension owns it. If the automatic document is already accurate, say so and stop; otherwise run `/pi-handoff flush` to refresh it from the latest events, or write your manual version to a path the user chooses.
 

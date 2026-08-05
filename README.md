@@ -85,7 +85,7 @@ It's plain Markdown on your disk. `/pi-handoff status` prints the path:
 
 ```bash
 /pi-handoff status
-$EDITOR ~/.pi/pi-handoff/-home-zteng-work-Tools-TanWords/HANDOFF.md
+$EDITOR ~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/HANDOFF.md
 ```
 
 Edit it freely — corrections you make are respected by the next refresh, which merges into whatever is currently on disk. (It's a merge, not an append, so the model may still rephrase or drop what it considers finished. Pin anything that must stick.)
@@ -111,7 +111,7 @@ Seven fixed sections, terse bullets, references to files rather than copies of t
 
 ```markdown
 # Current Goal
-Move the memory store to ~/.pi/pi-handoff and cut the layout to 3 files.
+Move the memory store to ~/.pi/agent/pi-handoff and cut the layout to 3 files.
 
 # Progress
 - store.ts rewritten: HandoffStore, path-based slug, snapshots as events
@@ -151,7 +151,7 @@ Budget is ~24 000 characters. If a refresh overshoots, the model gets one compre
 **Outside your project** — nothing is written into the repo, so there's nothing to gitignore and no risk of committing working state:
 
 ```
-~/.pi/pi-handoff/-home-zteng-work-Tools-TanWords/
+~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/
 ├── HANDOFF.md      the document
 ├── events.jsonl    append-only log; also holds previous versions
 └── meta.json       cursors, telemetry, which project this is
@@ -164,7 +164,7 @@ The directory is named after the project's absolute path with `/` folded to `-`,
 **Recovering an earlier version** — old documents are `snapshot` records in the log rather than loose files:
 
 ```bash
-STORE=~/.pi/pi-handoff/-home-zteng-work-Tools-TanWords
+STORE=~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords
 grep '"snapshot"' "$STORE/events.jsonl" | tail -1 | jq -r .doc     # the version before the last refresh
 ```
 
@@ -194,7 +194,7 @@ Also ships a `/skill:write-handoff` skill for when you want a handoff written by
 |---|---|
 | `PI_HANDOFF_MODEL` | `provider/model-id` for the summarizer. Default: probes for a cheap model you have auth for (gemini-flash, haiku, gpt-mini…), falls back to your active model. |
 | `PI_HANDOFF_THRESHOLD_CHARS` | New material required to trigger an auto-refresh (default `2000`). Lower = fresher document, more LLM calls. |
-| `PI_HANDOFF_DIR` | Root holding the per-project stores (default `~/.pi/pi-handoff`). |
+| `PI_HANDOFF_DIR` | Root holding the per-project stores (default `~/.pi/agent/pi-handoff`). |
 | `PI_HANDOFF_DEBUG` | `1` for stderr debug logs. |
 
 Example — pin the summarizer to a specific cheap model:

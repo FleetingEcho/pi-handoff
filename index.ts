@@ -2,7 +2,7 @@
  * pi-handoff — a self-maintaining HANDOFF.md per working directory, stored
  * outside the project.
  *
- * Each working directory gets its own store under ~/.pi/pi-handoff/, named
+ * Each working directory gets its own store under ~/.pi/agent/pi-handoff/, named
  * after the directory's absolute path (see resolveStoreRoot); nothing is
  * written into the repository itself.
  *

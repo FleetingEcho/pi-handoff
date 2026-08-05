@@ -4,7 +4,7 @@
  * Nothing is written into the project. Every working directory gets its own
  * directory, named after its absolute path, holding exactly three files:
  *
- *   ~/.pi/pi-handoff/-home-zteng-work-Tools-TanWords/
+ *   ~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/
  *   ├── HANDOFF.md     the handoff document (the point of all this)
  *   ├── events.jsonl   append-only log of what happened (trimmed in place)
  *   └── meta.json      cursors, telemetry, which project this belongs to
@@ -47,14 +47,15 @@ const DEFAULT_PINNED =
 
 const HANDOFF_SKELETON = `${HANDOFF_SECTIONS.map((s) => `# ${s}\n`).join("\n")}\n${DEFAULT_PINNED}`;
 
-/** Root of all per-project stores: $PI_HANDOFF_DIR, else ~/.pi/pi-handoff. */
+/** Root of all per-project stores: $PI_HANDOFF_DIR, else ~/.pi/agent/pi-handoff. */
 export function storeHome(): string {
 	const override = process.env.PI_HANDOFF_DIR?.trim();
 	if (override) {
 		const expanded = override.startsWith("~") ? join(homedir(), override.slice(1)) : override;
 		return isAbsolute(expanded) ? expanded : resolve(expanded);
 	}
-	return join(homedir(), CONFIG_DIR_NAME, "pi-handoff");
+	// alongside pi's own state (sessions/, extensions/, git/), not at the config root
+	return join(homedir(), CONFIG_DIR_NAME, "agent", "pi-handoff");
 }
 
 /** Longest directory name most filesystems accept, minus room for a suffix. */
@@ -149,7 +150,7 @@ export class HandoffStore {
 		this.metaPath = join(root, "meta.json");
 	}
 
-	/** Store for the given working directory, under ~/.pi/pi-handoff/<slug>/. */
+	/** Store for the given working directory, under ~/.pi/agent/pi-handoff/<slug>/. */
 	static forCwd(cwd: string): HandoffStore {
 		const { root, projectPath } = resolveStoreRoot(cwd);
 		return new HandoffStore(root, projectPath);
