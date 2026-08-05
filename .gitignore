@@ -1,0 +1,3 @@
+# symlinks into the local bun global install — must never be committed
+node_modules/
+bun.lock

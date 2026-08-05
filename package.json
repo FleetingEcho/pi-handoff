@@ -1,0 +1,22 @@
+{
+  "name": "pi-handoff",
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Self-maintaining HANDOFF.md per working directory for pi, stored under ~/.pi/pi-handoff.",
+  "license": "MIT",
+  "keywords": ["pi-package", "pi", "handoff"],
+  "pi": {
+    "extensions": ["./index.ts"],
+    "skills": ["./skills"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0"
+  }
+}
