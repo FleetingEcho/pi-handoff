@@ -1,5 +1,5 @@
 /**
- * Summarizer — the background LLM call that keeps HANDOFF.md current.
+ * Summarizer — the background LLM call that keeps handoff.md current.
  *
  * Never blocks the agent loop; callers serialize execution via a queue.
  */
@@ -111,11 +111,11 @@ function hasAllSections(doc: string): boolean {
 }
 
 // ---------------------------------------------------------------------------
-// Refresh (events -> HANDOFF.md)
+// Refresh (events -> handoff.md)
 // ---------------------------------------------------------------------------
 
 function refreshSystemPrompt(): string {
-	return `You maintain the HANDOFF document of an AI coding-agent project. Any future session — possibly a different agent — must be able to continue seamlessly from it.
+	return `You maintain the handoff document of an AI coding-agent project. Any future session — possibly a different agent — must be able to continue seamlessly from it.
 
 Output contract: EXACTLY these Markdown sections, in this order, and nothing else:
 ${HANDOFF_SECTIONS.map((s) => `# ${s}`).join("\n")}

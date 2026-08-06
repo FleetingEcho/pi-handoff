@@ -5,11 +5,11 @@
  * directory, named after its absolute path, holding exactly three files:
  *
  *   ~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/
- *   ├── HANDOFF.md     the handoff document (the point of all this)
+ *   ├── handoff.md     the handoff document (the point of all this)
  *   ├── events.jsonl   append-only log of what happened (trimmed in place)
  *   └── meta.json      cursors, telemetry, which project this belongs to
  *
- * No subdirectories, ever. Previous versions of HANDOFF.md are kept as
+ * No subdirectories, ever. Previous versions of handoff.md are kept as
  * `snapshot` records inside events.jsonl rather than as separate files.
  *
  * Writes are atomic: temp file -> rename.
@@ -41,6 +41,20 @@ const EVENTS_MAX_BYTES = 4 * 1024 * 1024;
 /** Trim down to this, not to the limit, so trimming is rare rather than constant. */
 const EVENTS_TARGET_BYTES = 2 * 1024 * 1024;
 const TRIM_CHECK_EVERY = 20;
+
+/**
+ * On graceful shutdown, clear events.jsonl entirely once it holds at least
+ * this many records — a clean slate for the next session. Below the threshold
+ * the log is left intact so recent snapshot history survives across restarts
+ * (the basis for recovering a prior handoff). At/above the threshold we wipe
+ * it, which also discards older snapshots (an accepted tradeoff for disk
+ * hygiene). 0 disables. Override via PI_HANDOFF_EXIT_CLEAR_LINES.
+ */
+const EVENTS_EXIT_CLEAR_LINES = (() => {
+	const raw = process.env.PI_HANDOFF_EXIT_CLEAR_LINES;
+	const parsed = raw !== undefined && raw.trim() !== "" ? Number.parseInt(raw, 10) : NaN;
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500; // explicit 0 disables; unset/garbage → default
+})();
 
 const DEFAULT_PINNED =
 	"# Pinned\n\n- (pinned notes are written by `/pi-handoff pin` and are never modified or removed by the summarizer)\n";
@@ -96,7 +110,7 @@ export interface HandoffEvent {
 	excerpts?: Array<{ role: "user" | "assistant" | "tool"; text: string; toolName?: string; targetPath?: string }>;
 	changedFiles?: string[];
 	note?: string;
-	/** For `snapshot`: the full HANDOFF.md text as it was before being overwritten. */
+	/** For `snapshot`: the full handoff.md text as it was before being overwritten. */
 	doc?: string;
 }
 
@@ -106,6 +120,13 @@ export interface Meta {
 	projectPath: string;
 	createdAt: string;
 	sessionId: string;
+	/** OS pid of the session that last took ownership of this store. Used to tell a
+	 * genuinely concurrent writer (pid still alive) from a sequential restart. */
+	pid: number;
+	/** ISO timestamp set when the owner ended gracefully (quit, /new, /resume, /fork,
+	 * /reload). Empty while a session is live. Lets the next session_start tell a
+	 * sequential handoff from a concurrent one without a false-positive warning. */
+	endedAt: string;
 	nextSeq: number;
 	lastCollectedSeq: number;
 	lastRefreshedSeq: number;
@@ -117,10 +138,12 @@ export interface Meta {
 function defaultMeta(): Meta {
 	const now = new Date().toISOString();
 	return {
-		schemaVersion: 2,
+		schemaVersion: 3,
 		projectPath: "",
 		createdAt: now,
 		sessionId: "",
+		pid: 0,
+		endedAt: "",
 		nextSeq: 1,
 		lastCollectedSeq: 0,
 		lastRefreshedSeq: 0,
@@ -145,7 +168,7 @@ export class HandoffStore {
 	constructor(root: string, projectPath = "") {
 		this.root = root;
 		this.projectPath = projectPath;
-		this.handoffPath = join(root, "HANDOFF.md");
+		this.handoffPath = join(root, "handoff.md");
 		this.eventsPath = join(root, "events.jsonl");
 		this.metaPath = join(root, "meta.json");
 	}
@@ -162,6 +185,14 @@ export class HandoffStore {
 
 	initSync(): void {
 		mkdirSync(this.root, { recursive: true });
+		// Migrate legacy uppercase filename → lowercase. On a case-sensitive FS
+		// (Linux) the two are distinct files, so rename the old one over. On a
+		// case-insensitive FS (macOS/Windows) both names resolve to the same file
+		// already, so existsSync(handoff.md) is true and we skip — a no-op there.
+		const legacy = join(this.root, "HANDOFF.md");
+		if (!existsSync(this.handoffPath) && existsSync(legacy)) {
+			try { renameSync(legacy, this.handoffPath); } catch { /* best-effort */ }
+		}
 		if (!existsSync(this.eventsPath)) writeFileSync(this.eventsPath, "");
 		if (!existsSync(this.handoffPath)) this.atomicWriteSync(this.handoffPath, HANDOFF_SKELETON);
 		this.meta = this.loadMeta();
@@ -231,7 +262,7 @@ export class HandoffStore {
 		return out;
 	}
 
-	/** Previous versions of HANDOFF.md, newest first — the replacement for history/. */
+	/** Previous versions of handoff.md, newest first — the replacement for history/. */
 	readSnapshots(limit = 10): Array<{ seq: number; timestamp: string; doc: string }> {
 		const out: Array<{ seq: number; timestamp: string; doc: string }> = [];
 		for (const line of this.readSafe(this.eventsPath).split("\n")) {
@@ -260,7 +291,7 @@ export class HandoffStore {
 
 	/**
 	 * Keep the log bounded by dropping its oldest lines in place — no archive
-	 * files. Only records already folded into HANDOFF.md are eligible, so a
+	 * files. Only records already folded into handoff.md are eligible, so a
 	 * pending refresh never loses its input.
 	 */
 	private maybeTrimEvents(): void {
@@ -288,6 +319,24 @@ export class HandoffStore {
 		}
 	}
 
+	/**
+	 * On graceful shutdown, drop the whole event log if it has grown to at least
+	 * EVENTS_EXIT_CLEAR_LINES records, for a clean slate next session. Returns
+	 * true if it cleared. Best-effort: a failure never fatalizes shutdown. Below
+	 * the threshold the log is kept so short sessions retain snapshot history.
+	 */
+	clearEventsOnShutdownIfLarge(): boolean {
+		if (EVENTS_EXIT_CLEAR_LINES <= 0) return false;
+		try {
+			const lines = this.readSafe(this.eventsPath).split("\n").filter((l) => l.trim());
+			if (lines.length < EVENTS_EXIT_CLEAR_LINES) return false;
+			this.atomicWriteSync(this.eventsPath, "");
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
 	// ------------------------------------------------------- curated document
 
 	/** Split the doc into the LLM-managed body and the program-managed Pinned section. */
@@ -309,7 +358,7 @@ export class HandoffStore {
 		this.atomicWriteSync(this.handoffPath, `${body.trimEnd()}\n\n---\n\n${next}`);
 	}
 
-	/** Write a refreshed HANDOFF (snapshotting the old one into the log). llmBody must already be validated. */
+	/** Write a refreshed handoff (snapshotting the old one into the log). llmBody must already be validated. */
 	writeHandoff(llmBody: string, opts: { snapshot: boolean }): void {
 		if (opts.snapshot) this.snapshot();
 		this.atomicWriteSync(this.handoffPath, this.composeHandoff(llmBody));

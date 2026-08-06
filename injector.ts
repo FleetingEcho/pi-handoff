@@ -1,5 +1,5 @@
 /**
- * Injector — inserts the current HANDOFF.md into the LLM context on every
+ * Injector — inserts the current handoff.md into the LLM context on every
  * request, via pi's `context` event.
  *
  * The event receives a deep copy of the message array: modifications are

@@ -1,5 +1,5 @@
 /**
- * pi-handoff — a self-maintaining HANDOFF.md per working directory, stored
+ * pi-handoff — a self-maintaining handoff.md per working directory, stored
  * outside the project.
  *
  * Each working directory gets its own store under ~/.pi/agent/pi-handoff/, named
@@ -7,7 +7,7 @@
  * written into the repository itself.
  *
  *   events.jsonl   append-only log, written by the collector (no LLM)
- *   HANDOFF.md     the document, refreshed in the background as work happens
+ *   handoff.md     the document, refreshed in the background as work happens
  *
  * Recall: every LLM call gets the current document injected via the `context`
  * event (non-destructive, never persisted into the session).
@@ -33,6 +33,18 @@ const REFRESH_TIMEOUT_MS = 120_000;
 const SHUTDOWN_GRACE_MS = 2_000;
 
 type Ctx = ExtensionContext;
+
+/** True if a process with `pid` is still running (best-effort: false if dead or unknown). */
+function isPidAlive(pid: number): boolean {
+	if (!pid || pid <= 0) return false;
+	try {
+		process.kill(pid, 0); // signal 0 = existence check, no signal sent
+		return true;
+	} catch (e: any) {
+		// ESRCH: no such process → dead. EPERM: exists but no permission → alive.
+		return e?.code === "EPERM";
+	}
+}
 
 /** Best-effort extension directory (used to locate the bundled skill). */
 const EXT_DIR: string = (() => {
@@ -157,15 +169,24 @@ export default function piHandoff(pi: ExtensionAPI) {
 			store.initSync();
 
 			const sid = ctx.sessionManager.getSessionId?.() ?? "";
-			const recent = Date.now() - Date.parse(store.meta.updatedAt || "1970-01-01") < 60_000;
-			if (store.meta.sessionId && sid && store.meta.sessionId !== sid && recent) {
-				notify(ctx, "pi-handoff: another session updated this handoff <1m ago — concurrent writers share files, last writer wins", "warning");
+			const prevSid = store.meta.sessionId;
+			// A prior owner that ended gracefully (quit, /new, /resume, /fork, /reload)
+			// is a sequential handoff, NOT a concurrent writer — never warn for it.
+			// Only warn when the prior owner never shut down AND its process is still
+			// alive, i.e. two sessions are genuinely writing the same files at once.
+			if (prevSid && sid && prevSid !== sid && !store.meta.endedAt) {
+				const recent = Date.now() - Date.parse(store.meta.updatedAt || "1970-01-01") < 60_000;
+				if (recent && isPidAlive(store.meta.pid)) {
+					notify(ctx, "pi-handoff: another session updated this handoff <1m ago — concurrent writers share files, last writer wins", "warning");
+				}
 			}
 			// pending chars derived from durable cursors (survives restarts)
 			store.pendingChars = store
 				.readEventsSince(store.meta.lastRefreshedSeq)
 				.reduce((n, e) => n + (e.excerpts ?? []).reduce((m, x) => m + x.text.length, 0), 0);
 			store.meta.sessionId = sid;
+			store.meta.pid = process.pid;
+			store.meta.endedAt = ""; // we're the live owner now
 			store.saveMetaSync();
 
 			collector = new Collector(store);
@@ -238,6 +259,14 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		try {
+			// Mark this session as ended gracefully so the next session_start (a
+			// fast restart, or an in-process /new, /resume, /fork, /reload) doesn't
+			// mistake itself for a concurrent writer. Best-effort: a crash skips
+			// this, but then the dead-pid check on the next start covers it.
+			if (store) {
+				store.meta.endedAt = new Date().toISOString();
+				store.saveMetaSync();
+			}
 			// Events are durable in events.jsonl (appended synchronously by the
 			// collector on turn_end) and pendingChars is recomputed from
 			// lastRefreshedSeq on the next session_start. Not flushing at shutdown
@@ -245,9 +274,15 @@ export default function piHandoff(pi: ExtensionAPI) {
 			// refreshes them. Blocking exit on a full LLM refresh is what made
 			// quitting slow, so abort anything in flight and return promptly.
 			// writeHandoff is atomic (temp+rename), so aborting mid-write cannot
-			// corrupt HANDOFF.md; lastRefreshedSeq only advances on success.
+			// corrupt handoff.md; lastRefreshedSeq only advances on success.
 			if (activeAbort) activeAbort.abort(new Error("pi-handoff: shutdown"));
 			if (inFlight) await Promise.race([inFlight, sleep(SHUTDOWN_GRACE_MS)]);
+			// Drop the event log for a clean slate next session if it grew large.
+			// Below EVENTS_EXIT_CLEAR_LINES (default 500) it's kept so recent snapshot
+			// history survives across restarts; at/above the threshold we wipe it —
+			// an accepted tradeoff that also discards older snapshots, so recovering
+			// a prior handoff returns nothing after such a restart.
+			if (store) store.clearEventsOnShutdownIfLarge();
 		} catch {
 			// never throw while shutting down
 		}
@@ -341,7 +376,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	const SUBCOMMANDS = [
 		["status", "Show handoff statistics"],
-		["flush", "Force a HANDOFF.md refresh now"],
+		["flush", "Force a handoff.md refresh now"],
 		["pin", "Add a durable note the summarizer never rewrites"],
 		["reset", "Start a fresh handoff for a new task (keeps Pinned)"],
 		["on", "Enable pi-handoff"],
@@ -349,7 +384,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 	] as const;
 
 	pi.registerCommand("pi-handoff", {
-		description: "pi-handoff: self-maintaining HANDOFF.md (status|flush|pin|reset|on|off)",
+		description: "pi-handoff: self-maintaining handoff.md (status|flush|pin|reset|on|off)",
 		getArgumentCompletions: (prefix: string) =>
 			SUBCOMMANDS.filter(([name]) => name.startsWith(prefix)).map(([value, label]) => ({ value, label })),
 		handler: async (args, ctx: ExtensionCommandContext) => {
@@ -388,7 +423,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 				`  project: ${m.projectPath || ctx.cwd}`,
 				`  enabled: ${m.enabled}   queue: ${busy ? "running" : "idle"}`,
 				`  events: ${m.nextSeq - 1} · pending ${kb(store.pendingChars)} (threshold ${kb(THRESHOLD)})`,
-				`  HANDOFF.md: ${kb(fsSize(store.handoffPath))} (refreshed at seq ${m.lastRefreshedSeq})`,
+				`  handoff.md: ${kb(fsSize(store.handoffPath))} (refreshed at seq ${m.lastRefreshedSeq})`,
 				`  summarizer: ${m.summarizerUsage.calls} calls, ${m.summarizerUsage.totalTokens} tokens${lastModel ? `, last via ${lastModel}` : ""}`,
 			].join("\n"),
 		);
@@ -400,7 +435,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 		const done = drain(ctx, { force: true, anyPending: true });
 		if (!done) return notify(ctx, "pi-handoff: nothing to flush");
 		await done;
-		notify(ctx, `pi-handoff: HANDOFF.md refreshed · ${kb(fsSize(store.handoffPath))}`);
+		notify(ctx, `pi-handoff: handoff.md refreshed · ${kb(fsSize(store.handoffPath))}`);
 	}
 
 	function cmdPin(ctx: Ctx, text: string): void {
@@ -416,13 +451,13 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (ctx.hasUI) {
 			const yes = await ctx.ui.confirm(
 				"pi-handoff — reset",
-				"Start a FRESH HANDOFF.md for a new task?\nThe Pinned section is kept and the current document stays recoverable in events.jsonl.",
+				"Start a FRESH handoff.md for a new task?\nThe Pinned section is kept and the current document stays recoverable in events.jsonl.",
 			);
 			if (!yes) return;
 		}
 		await ctx.waitForIdle();
 		await runExclusive(ctx, async () => resetHandoff());
-		notify(ctx, "pi-handoff: reset. Fresh HANDOFF.md ready for the next task.");
+		notify(ctx, "pi-handoff: reset. Fresh handoff.md ready for the next task.");
 	}
 
 	function cmdToggle(ctx: Ctx, enabled: boolean): void {
