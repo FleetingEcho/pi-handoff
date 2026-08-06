@@ -29,7 +29,8 @@ import { runRefresh } from "./summarizer";
 
 const THRESHOLD = Math.max(200, Number(process.env.PI_HANDOFF_THRESHOLD_CHARS ?? 2_000) || 2_000);
 const REFRESH_TIMEOUT_MS = 120_000;
-const SHUTDOWN_TIMEOUT_MS = 15_000;
+/** Max wait for an in-flight refresh to settle on shutdown (abort fires first; this is a backstop). */
+const SHUTDOWN_GRACE_MS = 2_000;
 
 type Ctx = ExtensionContext;
 
@@ -58,6 +59,8 @@ export default function piHandoff(pi: ExtensionAPI) {
 	let errors = 0;
 	let lastModel: string | null = null;
 	let resetOfferPending = false;
+	/** AbortController for the currently-running drain; aborted on shutdown so quit is prompt. */
+	let activeAbort: AbortController | null = null;
 
 	const debug = (msg: string) => {
 		if (process.env.PI_HANDOFF_DEBUG) console.error(`[pi-handoff] ${msg}`);
@@ -116,21 +119,28 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (!wanted) return null;
 		dirty = false;
 
+		const ac = new AbortController();
+		activeAbort = ac;
 		const p = runExclusive(ctx, async () => {
 			do {
 				try {
-					const r = await runRefresh(store!, modelCtx(ctx), opts.timeoutMs ?? REFRESH_TIMEOUT_MS);
+					const r = await runRefresh(store!, modelCtx(ctx), opts.timeoutMs ?? REFRESH_TIMEOUT_MS, ac.signal);
 					if (r?.modelSource) lastModel = r.modelSource;
+					errors = 0; // success → clear any transient error count
 				} catch (e) {
-					errors++;
-					debug(`refresh failed: ${e instanceof Error ? e.message : e}`);
+					// A shutdown abort is not an error — don't poison the error counter.
+					if (!ac.signal.aborted) {
+						errors++;
+						debug(`refresh failed: ${e instanceof Error ? e.message : e}`);
+					}
 					break; // events stay buffered; retried on next trigger
 				}
-			} while (store!.pendingChars >= THRESHOLD && !dirty);
+			} while (store!.pendingChars >= THRESHOLD && !dirty && !ac.signal.aborted);
 		});
 		inFlight = p.catch(() => {});
 		void p.finally(() => {
 			inFlight = null;
+			if (activeAbort === ac) activeAbort = null;
 		});
 		return p;
 	}
@@ -226,10 +236,18 @@ export default function piHandoff(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_shutdown", async (_event, ctx) => {
+	pi.on("session_shutdown", async () => {
 		try {
-			if (inFlight) await Promise.race([inFlight, sleep(SHUTDOWN_TIMEOUT_MS)]);
-			await drain(ctx, { force: true, anyPending: true, timeoutMs: SHUTDOWN_TIMEOUT_MS })?.catch(() => {});
+			// Events are durable in events.jsonl (appended synchronously by the
+			// collector on turn_end) and pendingChars is recomputed from
+			// lastRefreshedSeq on the next session_start. Not flushing at shutdown
+			// loses nothing — the next session picks up the un-folded events and
+			// refreshes them. Blocking exit on a full LLM refresh is what made
+			// quitting slow, so abort anything in flight and return promptly.
+			// writeHandoff is atomic (temp+rename), so aborting mid-write cannot
+			// corrupt HANDOFF.md; lastRefreshedSeq only advances on success.
+			if (activeAbort) activeAbort.abort(new Error("pi-handoff: shutdown"));
+			if (inFlight) await Promise.race([inFlight, sleep(SHUTDOWN_GRACE_MS)]);
 		} catch {
 			// never throw while shutting down
 		}

@@ -11,7 +11,7 @@ No "let me catch you up." No re-explaining the task. No `HANDOFF.md` cluttering 
 Requires pi ≥ 0.83.
 
 ```bash
-pi install git:github.com/FleetingEcho/pi-handoff@v1.0.0   # pinned tag (recommended)
+pi install git:github.com/FleetingEcho/pi-handoff   # pinned tag (recommended)
 ```
 
 Start pi and run `/pi-handoff`. You should see a status readout and a `handoff ●` indicator in the status bar. That's the whole setup — there is nothing to configure.
@@ -21,7 +21,7 @@ Start pi and run `/pi-handoff`. You should see a status readout and a `handoff �
 
 ```bash
 pi install git:github.com/FleetingEcho/pi-handoff             # track the default branch
-pi install -l git:github.com/FleetingEcho/pi-handoff@v1.0.0   # this project only (writes .pi/settings.json, commit it to share with teammates)
+pi install -l git:github.com/FleetingEcho/pi-handoff   # this project only (writes .pi/settings.json, commit it to share with teammates)
 pi -e git:github.com/FleetingEcho/pi-handoff                  # try it for one run, install nothing
 pi list                                                       # what's installed
 pi remove git:github.com/FleetingEcho/pi-handoff
@@ -30,7 +30,7 @@ pi remove git:github.com/FleetingEcho/pi-handoff
 Pinned git refs are **not** advanced by `pi update --extensions` — re-run `pi install` with the new tag to upgrade. The clone lands in `~/.pi/agent/git/github.com/FleetingEcho/pi-handoff` (or `.pi/git/...` for `-l`).
 
 SSH remotes work too and use your `~/.ssh/config`:
-`pi install git:git@github.com:FleetingEcho/pi-handoff@v1.0.0`
+`pi install git:git@github.com:FleetingEcho/pi-handoff`
 </details>
 
 ## Using it

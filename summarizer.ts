@@ -18,17 +18,8 @@ const DEBUG = () => !!process.env.PI_HANDOFF_DEBUG;
 // Model resolution
 // ---------------------------------------------------------------------------
 
-/** env override: PI_HANDOFF_MODEL="provider/model-id" */
+/** Optional env override: PI_HANDOFF_MODEL="provider/model-id". Not required — defaults to the active session model. */
 const CONFIGURED = process.env.PI_HANDOFF_MODEL;
-
-/** Cheap/fast candidates, matched by (provider, id-prefix). */
-const CANDIDATES: Array<[string, string]> = [
-	["google", "gemini-2.5-flash"],
-	["google", "gemini-3-flash"],
-	["anthropic", "claude-haiku-4"],
-	["openai", "gpt-5-mini"],
-	["openai", "gpt-5.1-mini"],
-];
 
 async function resolveModel(ctx: ModelCtx): Promise<{ model: NonNullable<ExtensionContext["model"]>; source: string } | null> {
 	const tryModel = async (model: NonNullable<ExtensionContext["model"]> | undefined, source: string) => {
@@ -47,20 +38,6 @@ async function resolveModel(ctx: ModelCtx): Promise<{ model: NonNullable<Extensi
 		}
 	}
 
-	for (const [provider, prefix] of CANDIDATES) {
-		const exact = await tryModel(ctx.modelRegistry.find(provider, prefix), `cheap ${provider}/${prefix}`);
-		if (exact) return exact;
-		// tolerate versioned ids (e.g. claude-haiku-4-5-20251001)
-		const avail = ctx.modelRegistry
-			.getAvailable()
-			.filter((m) => m.provider === provider && m.id.startsWith(prefix))
-			.sort((a, b) => a.id.localeCompare(b.id));
-		for (const m of avail) {
-			const hit = await tryModel(m, `cheap ${m.provider}/${m.id}`);
-			if (hit) return hit;
-		}
-	}
-
 	return tryModel(ctx.model ?? undefined, "active model");
 }
 
@@ -74,7 +51,7 @@ interface LlmResult {
 	modelSource: string;
 }
 
-async function callLlm(ctx: ModelCtx, systemPrompt: string, userText: string, timeoutMs: number): Promise<LlmResult> {
+async function callLlm(ctx: ModelCtx, systemPrompt: string, userText: string, timeoutMs: number, abortSignal?: AbortSignal): Promise<LlmResult> {
 	const resolved = await resolveModel(ctx);
 	if (!resolved) throw new Error("pi-handoff: no model with auth available for summarization");
 
@@ -83,6 +60,12 @@ async function callLlm(ctx: ModelCtx, systemPrompt: string, userText: string, ti
 
 	const ac = new AbortController();
 	const timer = setTimeout(() => ac.abort(new Error(`pi-handoff: summarizer timed out after ${timeoutMs}ms`)), timeoutMs);
+	// Propagate an external abort (e.g. session shutdown) into the request so
+	// quitting doesn't block waiting for a refresh we don't need to finish.
+	if (abortSignal) {
+		if (abortSignal.aborted) ac.abort(abortSignal.reason);
+		else abortSignal.addEventListener("abort", () => ac.abort(abortSignal.reason), { once: true });
+	}
 	try {
 		const response = await complete(
 			resolved.model,
@@ -184,7 +167,7 @@ export interface OpOutcome {
 	chars?: number;
 }
 
-export async function runRefresh(store: HandoffStore, ctx: ModelCtx, timeoutMs: number): Promise<OpOutcome> {
+export async function runRefresh(store: HandoffStore, ctx: ModelCtx, timeoutMs: number, abortSignal?: AbortSignal): Promise<OpOutcome> {
 	const events = store.readEventsSince(store.meta.lastRefreshedSeq).filter((e) => e.type === "turn_end" || e.type === "pin");
 	if (events.length === 0) return { skipped: true };
 
@@ -208,7 +191,7 @@ Merge the new events into the handoff document.`;
 		totalUsage.totalTokens += u.totalTokens ?? (u.input ?? 0) + (u.output ?? 0);
 	};
 
-	const res = await callLlm(ctx, systemPrompt, userText, timeoutMs);
+	const res = await callLlm(ctx, systemPrompt, userText, timeoutMs, abortSignal);
 	acc(res.usage);
 	let doc = extractDocument(res.text);
 	if (!hasAllSections(doc)) throw new Error("pi-handoff: summarizer output missing required sections");
@@ -220,6 +203,7 @@ Merge the new events into the handoff document.`;
 			`${systemPrompt}\n\nThe document is OVERSIZED. Tighten it aggressively: keep every section heading, drop the least important details, prefer paths over quoted content. Hard limit ${HANDOFF_CAP_CHARS} characters.`,
 			`<document>\n${doc}\n</document>`,
 			timeoutMs,
+			abortSignal,
 		);
 		acc(shrink.usage);
 		const shrunk = extractDocument(shrink.text);
