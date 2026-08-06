@@ -1,17 +1,17 @@
 # pi-handoff
 
-Every working directory you use pi in gets a `HANDOFF.md` that keeps itself up to date.
+Every working directory you use pi in gets a `handoff.md` that keeps itself up to date.
 
-You never write it, and you never have to remember to update it. As you work, the extension records what happened and periodically asks a cheap model to fold that into a short document: what the goal is, what's done, what was decided, which files matter, what's next. On your next session it is injected into the agent's context automatically — so `pi --resume` (or a brand-new session, or a different agent entirely) starts already knowing where you left off.
+You never write it, and you never have to remember to update it. As you work, the extension records what happened and periodically asks a model to fold that into a short document: what the goal is, what's done, what was decided, which files matter, what's next. On your next session it is injected into the agent's context automatically — so `pi --resume` (or a brand-new session, or a different agent entirely) starts already knowing where you left off.
 
-No "let me catch you up." No re-explaining the task. No `HANDOFF.md` cluttering your repo.
+No "let me catch you up." No re-explaining the task. No `handoff.md` cluttering your repo.
 
 ## Install
 
 Requires pi ≥ 0.83.
 
 ```bash
-pi install git:github.com/FleetingEcho/pi-handoff   # pinned tag (recommended)
+pi install git:github.com/FleetingEcho/pi-handoff#v1.5.0   # pinned tag (recommended)
 ```
 
 Start pi and run `/pi-handoff`. You should see a status readout and a `handoff ●` indicator in the status bar. That's the whole setup — there is nothing to configure.
@@ -27,25 +27,24 @@ pi list                                                       # what's installed
 pi remove git:github.com/FleetingEcho/pi-handoff
 ```
 
-Pinned git refs are **not** advanced by `pi update --extensions` — re-run `pi install` with the new tag to upgrade. The clone lands in `~/.pi/agent/git/github.com/FleetingEcho/pi-handoff` (or `.pi/git/...` for `-l`).
 
 SSH remotes work too and use your `~/.ssh/config`:
-`pi install git:git@github.com:FleetingEcho/pi-handoff`
+`pi install git:github.com/FleetingEcho/pi-handoff`
 </details>
 
 ## Using it
 
 ### Just work
 
-Open pi in a project and do whatever you were going to do. After roughly 2000 characters of new conversation, a background refresh folds recent turns into the document. It runs on a cheap model, never blocks you, and never interrupts.
+Open pi in a project and do whatever you were going to do. After roughly 2000 characters of new conversation, a background refresh folds recent turns into the document. It runs on your active model, never blocks you, and never interrupts.
 
 The status bar tells you what's going on:
 
 ```
-handoff ● ev 47 · 3.1k · pend 1.2k · gemini-2.5-flash
-         │    │      │        │       └─ model that did the last refresh
+handoff ● ev 47 · 3.1k · pend 1.2k · active model
+         │    │      │        │       └─ model that did the last refresh (defaults to your active model)
          │    │      │        └────────── new material not yet folded in
-         │    │      └─────────────────── size of HANDOFF.md
+         │    │      └─────────────────── size of handoff.md
          │    └────────────────────────── events recorded
          └─────────────────────────────── ● active   ↻ refreshing   ○ disabled
 ```
@@ -85,7 +84,7 @@ It's plain Markdown on your disk. `/pi-handoff status` prints the path:
 
 ```bash
 /pi-handoff status
-$EDITOR ~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/HANDOFF.md
+$EDITOR ~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/handoff.md
 ```
 
 Edit it freely — corrections you make are respected by the next refresh, which merges into whatever is currently on disk. (It's a merge, not an append, so the model may still rephrase or drop what it considers finished. Pin anything that must stick.)
@@ -152,7 +151,7 @@ Budget is ~24 000 characters. If a refresh overshoots, the model gets one compre
 
 ```
 ~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/
-├── HANDOFF.md      the document
+├── handoff.md      the document
 ├── events.jsonl    append-only log; also holds previous versions
 └── meta.json       cursors, telemetry, which project this is
 ```
@@ -171,7 +170,7 @@ grep '"snapshot"' "$STORE/events.jsonl" | tail -1 | jq -r .doc     # the version
 **Sharing one** — copy it into the repo deliberately:
 
 ```bash
-cp "$STORE/HANDOFF.md" docs/handoff.md && git add docs/handoff.md
+cp "$STORE/handoff.md" docs/handoff.md && git add docs/handoff.md
 ```
 
 For rules that should apply on *every* run rather than to the current task, use the project's `AGENTS.md` instead — every agent reads it every time.
@@ -181,7 +180,7 @@ For rules that should apply on *every* run rather than to the current task, use 
 | Command | What it does |
 |---|---|
 | `/pi-handoff` or `/pi-handoff status` | Store path, event count, doc size, cursors, summarizer token usage |
-| `/pi-handoff flush` | Refresh HANDOFF.md right now |
+| `/pi-handoff flush` | Refresh handoff.md right now |
 | `/pi-handoff pin <note>` | Append a durable note the summarizer never rewrites |
 | `/pi-handoff reset` | Fresh document for a new task (keeps Pinned; old version recoverable) |
 | `/pi-handoff on` / `/pi-handoff off` | Toggle collection, refresh, and injection |
@@ -192,24 +191,25 @@ Also ships a `/skill:write-handoff` skill for when you want a handoff written by
 
 | Var | Meaning |
 |---|---|
-| `PI_HANDOFF_MODEL` | `provider/model-id` for the summarizer. Default: probes for a cheap model you have auth for (gemini-flash, haiku, gpt-mini…), falls back to your active model. |
+| `PI_HANDOFF_MODEL` | `provider/model-id` for the summarizer. Default: your active session model — nothing to configure. Set this only if you want to pin a different (e.g. cheaper) model for refreshes. |
 | `PI_HANDOFF_THRESHOLD_CHARS` | New material required to trigger an auto-refresh (default `2000`). Lower = fresher document, more LLM calls. |
 | `PI_HANDOFF_DIR` | Root holding the per-project stores (default `~/.pi/agent/pi-handoff`). |
 | `PI_HANDOFF_DEBUG` | `1` for stderr debug logs. |
+| `PI_HANDOFF_EXIT_CLEAR_LINES` | On graceful shutdown, wipe `events.jsonl` if it has at least this many records (default `500`). Below it, the log is kept so recent snapshot history survives across restarts. `0` disables (the 4 MB in-place trim still bounds it). |
 
-Example — pin the summarizer to a specific cheap model:
+Example — pin the summarizer to a specific model (optional):
 
 ```bash
-export PI_HANDOFF_MODEL=google/gemini-2.5-flash
+export PI_HANDOFF_MODEL=provider/model-id
 ```
 
 ## Troubleshooting
 
-**The document isn't updating.** Check `/pi-handoff status`: if `pending` is below the threshold, nothing has accumulated yet — that's normal. If `enabled` is false, run `/pi-handoff on`. Otherwise run `PI_HANDOFF_DEBUG=1 pi` and watch stderr; the most common cause is no cheap model with working auth, in which case it falls back to your active model, and if that fails too the events simply stay buffered until the next attempt.
+**The document isn't updating.** Check `/pi-handoff status`: if `pending` is below the threshold, nothing has accumulated yet — that's normal. If `enabled` is false, run `/pi-handoff on`. Otherwise run `PI_HANDOFF_DEBUG=1 pi` and watch stderr; refreshes use your active model, so auth issues are the same ones you'd hit chatting — if a refresh fails the events simply stay buffered until the next attempt.
 
-**It didn't refresh when I quit.** The shutdown flush is best-effort with a 15s budget — pi may tear down the provider connection first. Nothing is lost: buffered events are merged at the start of the next session.
+**It didn't refresh when I quit.** By design it doesn't — quitting aborts any in-flight refresh (with a 2s backstop) so exit stays prompt. Normally nothing is lost: buffered events are durable in `events.jsonl` and merged at the start of the next session. One exception: if the log has grown to `PI_HANDOFF_EXIT_CLEAR_LINES` (default 500) records, it's wiped on exit for disk hygiene, so any not-yet-refreshed events would be lost in that case — set it to `0` to keep the log forever (the 4 MB in-place trim still bounds it).
 
-**Two pi sessions in the same directory.** They share the same files and the last writer wins. You'll get a warning at startup if another session wrote within the last minute.
+**Two pi sessions in the same directory.** They share the same files and the last writer wins. You'll get a warning at startup **only if the other session is still running** — quitting and immediately starting a new session (or an in-process `/new`, `/resume`, `/fork`, `/reload`) is recognized as a sequential handoff and stays quiet.
 
 **The document has stale or wrong information.** Edit the file directly, or `/pi-handoff reset` for a clean slate. To make a correction permanent, `/pi-handoff pin` it.
 
@@ -217,7 +217,7 @@ export PI_HANDOFF_MODEL=google/gemini-2.5-flash
 
 ```
 turn_end ────────► events.jsonl   redacted excerpts, no LLM, deterministic
-agent_settled ───► HANDOFF.md     background merge once enough is pending
+agent_settled ───► handoff.md     background merge once enough is pending
 every LLM call ──► injected into context (non-destructive, never persisted)
 ```
 
@@ -227,15 +227,12 @@ Refreshes trigger on `agent_settled` above the threshold, before context compact
 
 - All writes are atomic (temp file + rename); the previous document is recorded into the log before being replaced.
 - The log is trimmed in place past 4 MB, and only records already folded into the document are eligible — a pending refresh never loses its input.
+- On graceful shutdown, if the log has reached `PI_HANDOFF_EXIT_CLEAR_LINES` (default 500) records it is wiped entirely for a clean slate; smaller logs are kept so recent snapshot history survives across restarts.
 - Secrets: denylist redaction runs when excerpts are appended (before touching disk), before LLM calls, and on LLM output. The summarizer prompt refuses secrets and ignores instructions embedded in the material it summarizes.
 - Malformed JSONL lines are tolerated (crash-safe tail); queue state is in-memory only, so a crash can't wedge it.
 - Injection is non-destructive and never written into session files.
 
 ## Develop
-
-```bash
-git clone https://github.com/FleetingEcho/pi-handoff ~/.pi/agent/extensions/pi-handoff
-```
 
 That location is auto-discovered by pi in all projects. After edits: `/reload`. Quick isolated test: `pi -e ~/.pi/agent/extensions/pi-handoff/index.ts`.
 
