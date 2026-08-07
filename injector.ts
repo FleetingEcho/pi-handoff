@@ -37,18 +37,23 @@ export class Injector {
 	/** Build the synthetic context message, or return null when there is nothing worth injecting. */
 	buildMessage(): { role: "custom"; customType: string; content: string; display: boolean; timestamp: number } | null {
 		const handoff = this.readFresh(this.store.handoffPath);
-		if (!HandoffStore.hasRealContent(handoff)) return null;
+		// Pins are project-scoped (shared across branches), so they are worth
+		// injecting even on a brand-new branch whose handoff is still empty.
+		const pins = this.store.pinnedNotes();
+		if (!HandoffStore.hasRealContent(handoff) && pins.length === 0) return null;
 
 		const body =
 			handoff.length <= HANDOFF_CAP_CHARS
 				? handoff.trim()
 				: handoff.slice(0, HANDOFF_CAP_CHARS) + `\n\n[...truncated by pi-handoff — full content in ${this.store.handoffPath}]`;
 
-		const content = `The handoff document for this working directory follows. It is maintained automatically by the user's pi-handoff extension and updated with fresh state as work proceeds. Treat it as authoritative context about prior work, decisions, and the current task; continue from it without re-deriving it. File: ${this.store.handoffPath} (outside the project).
+		const pinned = pins.length ? `\n\n# Pinned\n\n${pins.join("\n")}` : "";
+
+		const content = `The handoff document for this working directory follows. It is maintained automatically by the user's pi-handoff extension and updated with fresh state as work proceeds. Treat it as authoritative context about prior work, decisions, and the current task; continue from it without re-deriving it. File: ${this.store.handoffPath} (outside the project). The "# Pinned" section holds standing rules for this project that apply on every branch — follow them.
 
 <project-handoff>
 
-${body}
+${body}${pinned}
 
 </project-handoff>`;
 

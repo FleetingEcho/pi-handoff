@@ -1,16 +1,28 @@
 /**
  * HandoffStore — on-disk persistence for pi-handoff.
  *
- * Nothing is written into the project. Every working directory gets its own
- * directory, named after its absolute path, holding exactly three files:
+ * Nothing is written into the project. Every project gets its own directory
+ * under the store root, named after the project root's absolute path (see
+ * resolveProjectRoot in index.ts — the git repo/worktree top-level when the
+ * working directory is inside a repo, so opening the agent from a
+ * subdirectory of the same repo lands on the SAME store; outside git the
+ * working directory itself is the key):
  *
- *   ~/.agent/agent-handoff/-home-zteng-work-Tools-TanWords/<branch-slug>/
- *   ├── handoff.md     the handoff document (the point of all this)
- *   ├── events.jsonl   append-only log of what happened (trimmed in place)
- *   └── meta.json      cursors, telemetry, which project/branch this belongs to
+ *   ~/.agent/agent-handoff/-home-zteng-work-Tools-TanWords/
+ *   ├── project.md         standing pinned rules, shared by EVERY branch
+ *   └── <branch-slug>/
+ *       ├── handoff.md     the handoff document (the point of all this)
+ *       ├── events.jsonl   append-only log of what happened (trimmed in place)
+ *       └── meta.json      cursors, telemetry, which project/branch this belongs to
  *
- * Each git branch gets its own subdirectory (and its own handoff.md), so
- * switching branches switches handoffs; a non-git directory uses "default".
+ * Two tiers, because the content has two different lifetimes. Task state (goal,
+ * progress, next steps) is per-branch: switching branches switches handoffs, and
+ * a non-git directory uses "default". Pinned rules ("deploys go through
+ * ops/deploy.sh") are per-PROJECT — true regardless of branch, so they live one
+ * level up and a brand-new branch inherits them instead of starting blank.
+ * migratePinnedToProject lifts legacy branch-local pins on first load. This
+ * layout is shared with opencode-handoff (same store root), so the two agents
+ * see the same pins.
  * Previous versions of handoff.md are kept as `snapshot` records inside
  * events.jsonl rather than as separate files.
  *
@@ -18,7 +30,7 @@
  */
 
 import { createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, appendFileSync, writeFileSync, renameSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
@@ -47,21 +59,24 @@ const TRIM_CHECK_EVERY = 20;
 /**
  * On graceful shutdown, clear events.jsonl entirely once it holds at least
  * this many records — a clean slate for the next session. Below the threshold
- * the log is left intact so recent snapshot history survives across restarts
- * (the basis for recovering a prior handoff). At/above the threshold we wipe
- * it, which also discards older snapshots (an accepted tradeoff for disk
- * hygiene). 0 disables. Override via PI_HANDOFF_EXIT_CLEAR_LINES.
+ * the log is left intact so recent snapshot history survives across restarts.
+ *
+ * DEFAULTS TO OFF (0) for pi-handoff: the store is shared with opencode-handoff
+ * (and any other agent) at ~/.agent/agent-handoff, so wiping the log on one
+ * agent's exit would discard events another concurrent agent still needs.
+ * Set PI_HANDOFF_EXIT_CLEAR_LINES to a positive number (e.g. 500) to
+ * enable the disk-hygiene wipe when you only ever run one agent at a time.
  */
 const EVENTS_EXIT_CLEAR_LINES = (() => {
 	const raw = process.env.PI_HANDOFF_EXIT_CLEAR_LINES;
 	const parsed = raw !== undefined && raw.trim() !== "" ? Number.parseInt(raw, 10) : NaN;
-	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 500; // explicit 0 disables; unset/garbage → default
+	return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0; // default 0 (off) for the shared store
 })();
 
 const DEFAULT_PINNED =
 	"# Pinned\n\n- (pinned notes are written by `/pi-handoff pin` and are never modified or removed by the summarizer)\n";
 
-const HANDOFF_SKELETON = `${HANDOFF_SECTIONS.map((s) => `# ${s}\n`).join("\n")}\n${DEFAULT_PINNED}`;
+const HANDOFF_SKELETON = `${HANDOFF_SECTIONS.map((s) => `# ${s}\n`).join("\n")}`;
 
 /**
  * Root of all per-project stores: $PI_HANDOFF_DIR, else ~/.agent/agent-handoff.
@@ -126,21 +141,14 @@ function readMetaBranch(metaPath: string): string | null {
 }
 
 /**
- * Per-project, per-branch store directory, derived from the working directory's
- * absolute path and the current git branch. The working directory becomes a
+ * Per-project, per-branch store directory, derived from the project root's
+ * absolute path and the current git branch. The project root becomes a
  * container directory; each branch gets a subdirectory inside it. If another
  * branch already occupies the sanitized slug, a short hash is appended so the
  * two can't clobber each other.
  */
 export function resolveStoreRoot(cwd: string, branch: string): { root: string; projectPath: string; cwdSlug: string; branchSlug: string } {
-	let abs = resolve(cwd);
-	try {
-		abs = realpathSync(abs); // symlinked checkouts must map to one store
-	} catch {
-		// path may not exist yet — key off what we were given
-	}
-	const cwdSlug = pathSlug(abs);
-	const container = join(storeHome(), cwdSlug);
+	const { abs, cwdSlug, container } = projectKey(cwd);
 	let bSlug = branchSlug(branch);
 	const candidate = join(container, bSlug);
 	if (existsSync(candidate)) {
@@ -152,13 +160,91 @@ export function resolveStoreRoot(cwd: string, branch: string): { root: string; p
 	return { root: join(container, bSlug), projectPath: abs, cwdSlug, branchSlug: bSlug };
 }
 
+/**
+ * One-time carry of a cwd-keyed container (pre-v0.9.0 layout, where the store
+ * was named after the working directory itself) to the repo-root key. Fires
+ * only when the repo-root container doesn't exist yet and the legacy cwd-keyed
+ * one does — it can never clobber, and it never merges: a project historically
+ * opened from several different subdirectories keeps its FIRST-seen legacy
+ * store, and any others stay on disk, orphaned but intact.
+ */
+export function migrateProjectKey(cwd: string, projectRoot: string): boolean {
+	if (cwd === projectRoot) return false;
+	const from = projectKey(cwd).container;
+	const to = projectKey(projectRoot).container;
+	if (from === to) return false;
+	try {
+		if (!existsSync(from) || existsSync(to)) return false;
+		renameSync(from, to);
+		return true;
+	} catch {
+		return false; // best-effort: nothing moved beats half-moved
+	}
+}
+
+/** Absolute path + container dir + slug for a working directory. */
+export function projectKey(cwd: string): { abs: string; cwdSlug: string; container: string } {
+	let abs = resolve(cwd);
+	try {
+		abs = realpathSync(abs); // symlinked checkouts must map to one store
+	} catch {
+		// path may not exist yet — key off what we were given
+	}
+	const cwdSlug = pathSlug(abs);
+	return { abs, cwdSlug, container: join(storeHome(), cwdSlug) };
+}
+
+export interface BranchDoc {
+	/** True branch name from the store's meta.json (directory slug as fallback). */
+	branch: string;
+	path: string;
+	doc: string;
+}
+
+/**
+ * Read every branch handoff of the PROJECT that owns `cwd` — all branch
+ * subdirectories under the project container, plus the pre-v0.4.0 flat
+ * handoff.md if it still carries content. Docs without real content (fresh
+ * skeletons) are skipped. Read-only; feeds `/pi-handoff distill`.
+ */
+export function listBranchDocs(cwd: string): BranchDoc[] {
+	const { container } = projectKey(cwd);
+	const out: BranchDoc[] = [];
+	const readDoc = (p: string): string => {
+		try {
+			return readFileSync(p, "utf8");
+		} catch {
+			return "";
+		}
+	};
+	try {
+		for (const ent of readdirSync(container, { withFileTypes: true })) {
+			if (!ent.isDirectory()) continue;
+			const p = join(container, ent.name, "handoff.md");
+			const doc = readDoc(p);
+			if (!HandoffStore.hasRealContent(doc)) continue;
+			out.push({ branch: readMetaBranch(join(container, ent.name, "meta.json")) ?? ent.name, path: p, doc });
+		}
+		const flat = join(container, "handoff.md");
+		if (existsSync(flat) && statSync(flat).isFile()) {
+			const doc = readDoc(flat);
+			if (HandoffStore.hasRealContent(doc)) out.push({ branch: "(flat, pre-branch layout)", path: flat, doc });
+		}
+	} catch {
+		// whatever was readable is enough for a best-effort distill
+	}
+	return out;
+}
+
+/** Read just the `branch` field from a store's meta.json, or null if absent/unreadable. */
+
 export interface HandoffEvent {
 	schemaVersion: number;
 	seq: number;
 	sessionId: string;
 	turn: number;
 	timestamp: string;
-	type: "turn_end" | "pin" | "reset" | "compact" | "snapshot";
+	type: "turn_end" | "pin" | "clear" | "compact" | "snapshot";
 	excerpts?: Array<{ role: "user" | "assistant" | "tool"; text: string; toolName?: string; targetPath?: string }>;
 	changedFiles?: string[];
 	note?: string;
@@ -213,6 +299,9 @@ export class HandoffStore {
 	readonly handoffPath: string;
 	readonly eventsPath: string;
 	readonly metaPath: string;
+	/** Project-level pinned doc, one level up from the branch dir and therefore
+	 * shared by every branch of this project. */
+	readonly projectDocPath: string;
 	/** Working directory this store belongs to ("" when unknown). */
 	readonly projectPath: string;
 	/** Git branch this store is scoped to ("default" when not in a repo). */
@@ -234,6 +323,7 @@ export class HandoffStore {
 		this.handoffPath = join(root, "handoff.md");
 		this.eventsPath = join(root, "events.jsonl");
 		this.metaPath = join(root, "meta.json");
+		this.projectDocPath = join(dirname(root), "project.md");
 	}
 
 	/** Store for the given working directory + git branch, under ~/.agent/agent-handoff/<cwd-slug>/<branch-slug>/. */
@@ -265,6 +355,8 @@ export class HandoffStore {
 		}
 		if (!existsSync(this.eventsPath)) writeFileSync(this.eventsPath, "");
 		if (!existsSync(this.handoffPath)) this.atomicWriteSync(this.handoffPath, HANDOFF_SKELETON);
+		if (!existsSync(this.projectDocPath)) this.atomicWriteSync(this.projectDocPath, DEFAULT_PINNED);
+		this.migratePinnedToProject();
 		this.meta = this.loadMeta();
 		let changed = false;
 		if (!this.meta.projectPath && this.projectPath) {
@@ -452,6 +544,7 @@ export class HandoffStore {
 	 * EVENTS_EXIT_CLEAR_LINES records, for a clean slate next session. Returns
 	 * true if it cleared. Best-effort: a failure never fatalizes shutdown. Below
 	 * the threshold the log is kept so short sessions retain snapshot history.
+	 * DEFAULTS TO OFF for the shared store (see EVENTS_EXIT_CLEAR_LINES).
 	 */
 	clearEventsOnShutdownIfLarge(): boolean {
 		if (EVENTS_EXIT_CLEAR_LINES <= 0) return false;
@@ -467,23 +560,91 @@ export class HandoffStore {
 
 	// ------------------------------------------------------- curated document
 
-	/** Split the doc into the LLM-managed body and the program-managed Pinned section. */
+	/** Split a doc into the LLM-managed body and a trailing Pinned section.
+	 * Pins now live in project.md; this remains for reading legacy handoff.md
+	 * files (see migratePinnedToProject) and for stripping a stray section
+	 * should the summarizer emit one despite being told not to. */
 	splitPinned(doc: string): { body: string; pinned: string | null } {
 		const idx = doc.search(/^# Pinned\s*$/m);
 		if (idx < 0) return { body: doc, pinned: null };
 		return { body: doc.slice(0, idx).trimEnd(), pinned: doc.slice(idx).trimEnd() + "\n" };
 	}
 
-	/** Assemble the final doc: LLM output + re-attached Pinned. */
-	composeHandoff(llmBody: string): string {
-		const { pinned } = this.splitPinned(this.readHandoff());
-		return `${llmBody.trimEnd()}\n\n---\n\n${pinned ?? DEFAULT_PINNED}`;
+	/** The project-level pinned doc, shared by every branch of this project. */
+	readProjectDoc(): string {
+		return this.readSafe(this.projectDocPath);
 	}
 
-	appendPinned(note: string): void {
+	/** Pinned notes as bullet lines, excluding the placeholder. Empty when none. */
+	pinnedNotes(): string[] {
+		return this.readProjectDoc()
+			.split("\n")
+			.filter((l) => l.startsWith("- ") && !l.startsWith("- (pinned notes"))
+			.map((l) => l.trim());
+	}
+
+	/** Assemble the final doc. Pins are no longer part of handoff.md — if the
+	 * summarizer emitted a Pinned section anyway, drop it rather than persist a
+	 * branch-local copy that would drift from project.md. */
+	composeHandoff(llmBody: string): string {
+		return `${this.splitPinned(llmBody).body.trimEnd()}\n`;
+	}
+
+	/** Append a durable note to the PROJECT-level pinned doc, so it survives
+	 * branch switches and new branches inherit it. Returns false when the note
+	 * is already pinned — re-noticing the same fact must not grow the file. */
+	appendPinned(note: string): boolean {
+		const clean = note.replace(/\n+/g, " ").trim();
+		if (!clean) return false;
+		const norm = (s: string) => s.replace(/^-\s*/, "").trim().toLowerCase();
+		if (this.pinnedNotes().some((n) => norm(n) === norm(clean))) return false;
+		const current = this.readProjectDoc().trimEnd() || DEFAULT_PINNED.trimEnd();
+		this.atomicWriteSync(this.projectDocPath, `${current}\n- ${clean}\n`);
+		return true;
+	}
+
+	/**
+	 * Remove a pinned note by case-insensitive substring. Pins are project-wide
+	 * and permanent, so an ambiguous match removes NOTHING and reports the
+	 * candidates for the caller to disambiguate — deleting the wrong standing
+	 * rule is worse than making the user type a longer match.
+	 */
+	removePinned(match: string): { removed: string | null; candidates: string[] } {
+		const needle = match.trim().toLowerCase();
+		const notes = this.pinnedNotes();
+		const hits = needle ? notes.filter((n) => n.toLowerCase().includes(needle)) : [];
+		if (hits.length !== 1) return { removed: null, candidates: hits };
+		const kept = this.readProjectDoc()
+			.split("\n")
+			.filter((l) => l.trim() !== hits[0]);
+		this.atomicWriteSync(this.projectDocPath, `${kept.join("\n").trimEnd()}\n`);
+		return { removed: hits[0], candidates: [] };
+	}
+
+	/** One-time move of a legacy branch-local Pinned section into project.md.
+	 * Runs on init for every branch store, so pins written before this version
+	 * are recovered into the shared doc exactly once (duplicates are skipped,
+	 * since several branches may each carry a copy). */
+	private migratePinnedToProject(): void {
 		const { body, pinned } = this.splitPinned(this.readHandoff());
-		const next = `${(pinned ?? DEFAULT_PINNED).trimEnd()}\n- ${note.replace(/\n+/g, " ").trim()}\n`;
-		this.atomicWriteSync(this.handoffPath, `${body.trimEnd()}\n\n---\n\n${next}`);
+		if (!pinned) return;
+		const notes = pinned
+			.split("\n")
+			.filter((l) => l.startsWith("- ") && !l.startsWith("- (pinned notes"))
+			.map((l) => l.trim());
+		try {
+			if (notes.length) {
+				const have = new Set(this.pinnedNotes());
+				const add = notes.filter((n) => !have.has(n));
+				if (add.length) {
+					const current = this.readProjectDoc().trimEnd() || DEFAULT_PINNED.trimEnd();
+					this.atomicWriteSync(this.projectDocPath, `${current}\n${add.join("\n")}\n`);
+				}
+			}
+			this.atomicWriteSync(this.handoffPath, `${body.trimEnd()}\n`);
+		} catch {
+			// best-effort — a failed migration must not block startup
+		}
 	}
 
 	/** Write a refreshed handoff (snapshotting the old one into the log). llmBody must already be validated. */
@@ -492,11 +653,11 @@ export class HandoffStore {
 		this.atomicWriteSync(this.handoffPath, this.composeHandoff(llmBody));
 	}
 
-	/** Start a fresh handoff for a new task, keeping the Pinned section. */
-	resetKeepingPinned(): void {
-		const { pinned } = this.splitPinned(this.readHandoff());
+	/** Start a fresh handoff for a new task. Pins are untouched — they live in
+	 * project.md and are not this branch's task state. */
+	clearTaskState(): void {
 		this.snapshot();
-		this.atomicWriteSync(this.handoffPath, HANDOFF_SKELETON.replace(DEFAULT_PINNED, (pinned ?? DEFAULT_PINNED).trimEnd() + "\n"));
+		this.atomicWriteSync(this.handoffPath, HANDOFF_SKELETON);
 	}
 
 	/** Record the current document into the event log before it is overwritten. */
