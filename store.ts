@@ -4,13 +4,15 @@
  * Nothing is written into the project. Every working directory gets its own
  * directory, named after its absolute path, holding exactly three files:
  *
- *   ~/.pi/agent/pi-handoff/-home-zteng-work-Tools-TanWords/
+ *   ~/.agent/agent-handoff/-home-zteng-work-Tools-TanWords/<branch-slug>/
  *   ├── handoff.md     the handoff document (the point of all this)
  *   ├── events.jsonl   append-only log of what happened (trimmed in place)
- *   └── meta.json      cursors, telemetry, which project this belongs to
+ *   └── meta.json      cursors, telemetry, which project/branch this belongs to
  *
- * No subdirectories, ever. Previous versions of handoff.md are kept as
- * `snapshot` records inside events.jsonl rather than as separate files.
+ * Each git branch gets its own subdirectory (and its own handoff.md), so
+ * switching branches switches handoffs; a non-git directory uses "default".
+ * Previous versions of handoff.md are kept as `snapshot` records inside
+ * events.jsonl rather than as separate files.
  *
  * Writes are atomic: temp file -> rename.
  */
@@ -18,7 +20,7 @@
 import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, appendFileSync, writeFileSync, renameSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 
 export const HANDOFF_SECTIONS = [
@@ -61,14 +63,25 @@ const DEFAULT_PINNED =
 
 const HANDOFF_SKELETON = `${HANDOFF_SECTIONS.map((s) => `# ${s}\n`).join("\n")}\n${DEFAULT_PINNED}`;
 
-/** Root of all per-project stores: $PI_HANDOFF_DIR, else ~/.pi/agent/pi-handoff. */
+/**
+ * Root of all per-project stores: $PI_HANDOFF_DIR, else ~/.agent/agent-handoff.
+ * Lives under a shared, tool-neutral ~/.agent root (not pi's own config dir) so
+ * other agents can read the handoff documents too.
+ */
 export function storeHome(): string {
 	const override = process.env.PI_HANDOFF_DIR?.trim();
 	if (override) {
 		const expanded = override.startsWith("~") ? join(homedir(), override.slice(1)) : override;
 		return isAbsolute(expanded) ? expanded : resolve(expanded);
 	}
-	// alongside pi's own state (sessions/, extensions/, git/), not at the config root
+	return join(homedir(), ".agent", "agent-handoff");
+}
+
+/**
+ * Pre-v0.3.6 store root: ~/.pi/agent/pi-handoff. Used only by the one-time
+ * migration in initSync() to carry existing stores forward to storeHome().
+ */
+function legacyStoreHome(): string {
 	return join(homedir(), CONFIG_DIR_NAME, "agent", "pi-handoff");
 }
 
@@ -88,16 +101,55 @@ export function pathSlug(abs: string): string {
 	return `${flat.slice(flat.length - SLUG_MAX)}-${hash}`;
 }
 
-/** Per-project store directory, derived from the working directory's absolute path. */
-export function resolveStoreRoot(cwd: string): { root: string; projectPath: string; slug: string } {
+/**
+ * Directory name for a git branch: the branch name with every non-portable
+ * character folded to `-` (so `feature/auth` → `feature-auth`). Branches whose
+ * names collide after sanitizing (e.g. `feature/x` and `feature-x`, both →
+ * `feature-x`) are disambiguated by resolveStoreRoot via a short hash.
+ * "default" for the empty/non-git case.
+ */
+export function branchSlug(branch: string): string {
+	const flat = branch.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "") || "default";
+	if (flat.length <= SLUG_MAX) return flat;
+	const hash = createHash("sha256").update(branch).digest("hex").slice(0, 8);
+	return `${flat.slice(flat.length - SLUG_MAX)}-${hash}`;
+}
+
+/** Read just the `branch` field from a store's meta.json, or null if absent/unreadable. */
+function readMetaBranch(metaPath: string): string | null {
+	try {
+		const m = JSON.parse(readFileSync(metaPath, "utf8")) as Partial<Meta>;
+		return typeof m.branch === "string" && m.branch ? m.branch : null;
+	} catch {
+		return null;
+	}
+}
+
+/**
+ * Per-project, per-branch store directory, derived from the working directory's
+ * absolute path and the current git branch. The working directory becomes a
+ * container directory; each branch gets a subdirectory inside it. If another
+ * branch already occupies the sanitized slug, a short hash is appended so the
+ * two can't clobber each other.
+ */
+export function resolveStoreRoot(cwd: string, branch: string): { root: string; projectPath: string; cwdSlug: string; branchSlug: string } {
 	let abs = resolve(cwd);
 	try {
 		abs = realpathSync(abs); // symlinked checkouts must map to one store
 	} catch {
 		// path may not exist yet — key off what we were given
 	}
-	const slug = pathSlug(abs);
-	return { root: join(storeHome(), slug), projectPath: abs, slug };
+	const cwdSlug = pathSlug(abs);
+	const container = join(storeHome(), cwdSlug);
+	let bSlug = branchSlug(branch);
+	const candidate = join(container, bSlug);
+	if (existsSync(candidate)) {
+		const existing = readMetaBranch(join(candidate, "meta.json"));
+		if (existing && existing !== branch) {
+			bSlug = `${bSlug}-${createHash("sha256").update(branch).digest("hex").slice(0, 8)}`;
+		}
+	}
+	return { root: join(container, bSlug), projectPath: abs, cwdSlug, branchSlug: bSlug };
 }
 
 export interface HandoffEvent {
@@ -118,6 +170,8 @@ export interface Meta {
 	schemaVersion: number;
 	/** Working directory this store belongs to (replaces the old project.json). */
 	projectPath: string;
+	/** Git branch this store is scoped to ("default" when not in a repo). */
+	branch: string;
 	createdAt: string;
 	sessionId: string;
 	/** OS pid of the session that last took ownership of this store. Used to tell a
@@ -140,6 +194,7 @@ function defaultMeta(): Meta {
 	return {
 		schemaVersion: 3,
 		projectPath: "",
+		branch: "",
 		createdAt: now,
 		sessionId: "",
 		pid: 0,
@@ -160,23 +215,36 @@ export class HandoffStore {
 	readonly metaPath: string;
 	/** Working directory this store belongs to ("" when unknown). */
 	readonly projectPath: string;
+	/** Git branch this store is scoped to ("default" when not in a repo). */
+	readonly branch: string;
+	/** Slug of the working directory — the container under storeHome(). */
+	readonly cwdSlug: string;
 
 	meta: Meta = defaultMeta();
 	/** chars of turn_end excerpts collected since lastRefreshedSeq (maintained on append, recomputed on load) */
 	pendingChars = 0;
+	/** # of turn_end events collected since lastRefreshedSeq — the turn-count backstop for auto-refresh (maintained on append, recomputed on load). */
+	turnsSinceRefresh = 0;
 
-	constructor(root: string, projectPath = "") {
+	constructor(root: string, projectPath = "", branch = "", cwdSlug = "") {
 		this.root = root;
 		this.projectPath = projectPath;
+		this.branch = branch;
+		this.cwdSlug = cwdSlug;
 		this.handoffPath = join(root, "handoff.md");
 		this.eventsPath = join(root, "events.jsonl");
 		this.metaPath = join(root, "meta.json");
 	}
 
-	/** Store for the given working directory, under ~/.pi/agent/pi-handoff/<slug>/. */
+	/** Store for the given working directory + git branch, under ~/.agent/agent-handoff/<cwd-slug>/<branch-slug>/. */
+	static forCwdAndBranch(cwd: string, branch: string): HandoffStore {
+		const { root, projectPath, cwdSlug } = resolveStoreRoot(cwd, branch);
+		return new HandoffStore(root, projectPath, branch, cwdSlug);
+	}
+
+	/** Store for the given working directory on the "default" (non-git) branch. */
 	static forCwd(cwd: string): HandoffStore {
-		const { root, projectPath } = resolveStoreRoot(cwd);
-		return new HandoffStore(root, projectPath);
+		return HandoffStore.forCwdAndBranch(cwd, "default");
 	}
 
 	get exists(): boolean {
@@ -185,6 +253,8 @@ export class HandoffStore {
 
 	initSync(): void {
 		mkdirSync(this.root, { recursive: true });
+		this.migrateFromLegacyRoot();
+		this.migrateFlatToBranch();
 		// Migrate legacy uppercase filename → lowercase. On a case-sensitive FS
 		// (Linux) the two are distinct files, so rename the old one over. On a
 		// case-insensitive FS (macOS/Windows) both names resolve to the same file
@@ -196,9 +266,65 @@ export class HandoffStore {
 		if (!existsSync(this.eventsPath)) writeFileSync(this.eventsPath, "");
 		if (!existsSync(this.handoffPath)) this.atomicWriteSync(this.handoffPath, HANDOFF_SKELETON);
 		this.meta = this.loadMeta();
+		let changed = false;
 		if (!this.meta.projectPath && this.projectPath) {
 			this.meta.projectPath = this.projectPath;
-			this.saveMetaSync();
+			changed = true;
+		}
+		if (!this.meta.branch && this.branch) {
+			this.meta.branch = this.branch;
+			changed = true;
+		}
+		if (changed) this.saveMetaSync();
+	}
+
+	/**
+	 * One-time move from the pre-v0.3.6 root (~/.pi/agent/pi-handoff/<slug>/) to
+	 * the current root (~/.agent/agent-handoff/<slug>/). Fires only when the new
+	 * store has no handoff.md yet but the legacy location does, so it's safe to
+	 * run every session and never clobbers a store already at the new path.
+	 * Best-effort: a failure falls through to a fresh skeleton.
+	 */
+	private migrateFromLegacyRoot(): void {
+		const legacyRoot = join(legacyStoreHome(), this.cwdSlug);
+		if (legacyRoot === this.root) return;
+		if (existsSync(this.handoffPath)) return; // new store already populated
+		if (!existsSync(join(legacyRoot, "handoff.md"))) return;
+		try {
+			for (const name of ["handoff.md", "events.jsonl", "meta.json"] as const) {
+				const from = join(legacyRoot, name);
+				if (existsSync(from)) renameSync(from, join(this.root, name));
+			}
+		} catch {
+			// best-effort — leave whatever moved in place, continue with fresh init
+		}
+	}
+
+	/**
+	 * One-time move from the pre-v0.4.0 flat layout (~/.agent/agent-handoff/<cwd-slug>/
+	 * with handoff.md sitting directly inside the container) into this branch's
+	 * subdirectory. Fires only when the branch store has no handoff.md yet but the
+	 * container's flat handoff.md does, so it's safe to run every session and never
+	 * clobbers a store already at the new path. Best-effort: a failure falls through
+	 * to a fresh skeleton. The current branch inherits the pre-branch handoff;
+	 * other branches start fresh.
+	 */
+	private migrateFlatToBranch(): void {
+		if (existsSync(this.handoffPath)) return; // branch store already populated
+		const container = dirname(this.root); // <storeHome>/<cwdSlug>
+		const flatHandoff = join(container, "handoff.md");
+		try {
+			if (!existsSync(flatHandoff) || !statSync(flatHandoff).isFile()) return;
+		} catch {
+			return;
+		}
+		try {
+			for (const name of ["handoff.md", "events.jsonl", "meta.json"] as const) {
+				const from = join(container, name);
+				if (existsSync(from) && statSync(from).isFile()) renameSync(from, join(this.root, name));
+			}
+		} catch {
+			// best-effort
 		}
 	}
 
@@ -241,6 +367,7 @@ export class HandoffStore {
 		if (full.type === "turn_end") {
 			this.meta.lastCollectedSeq = full.seq;
 			this.pendingChars += (full.excerpts ?? []).reduce((n, e) => n + e.text.length, 0);
+			this.turnsSinceRefresh++;
 		}
 		this.saveMetaSync();
 		this.maybeTrimEvents();
@@ -280,6 +407,7 @@ export class HandoffStore {
 	markRefreshed(throughSeq: number): void {
 		this.meta.lastRefreshedSeq = throughSeq;
 		this.pendingChars = 0;
+		this.turnsSinceRefresh = 0;
 		this.saveMetaSync();
 	}
 

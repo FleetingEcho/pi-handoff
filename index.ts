@@ -2,21 +2,27 @@
  * pi-handoff — a self-maintaining handoff.md per working directory, stored
  * outside the project.
  *
- * Each working directory gets its own store under ~/.pi/agent/pi-handoff/, named
- * after the directory's absolute path (see resolveStoreRoot); nothing is
- * written into the repository itself.
+ * Each working directory gets its own store under ~/.agent/agent-handoff/,
+ * named after the directory's absolute path (see resolveStoreRoot); and each
+ * git branch gets its own subdirectory within it. Nothing is written into the
+ * repository itself.
  *
  *   events.jsonl   append-only log, written by the collector (no LLM)
  *   handoff.md     the document, refreshed in the background as work happens
+ *
+ * The branch is detected at session start and re-checked at the start of every
+ * turn, so a mid-session `git checkout` swaps to that branch's handoff. A
+ * non-git directory uses a single "default" branch.
  *
  * Recall: every LLM call gets the current document injected via the `context`
  * event (non-destructive, never persisted into the session).
  *
  * Commands: /pi-handoff status|flush|pin|reset|on|off
- * Env:      PI_HANDOFF_MODEL=provider/id  PI_HANDOFF_THRESHOLD_CHARS=2000
- *           PI_HANDOFF_DIR=<dir>  PI_HANDOFF_DEBUG=1
+ * Env:      PI_HANDOFF_MODEL=provider/id  PI_HANDOFF_THRESHOLD_CHARS=8000
+ *           PI_HANDOFF_THRESHOLD_TURNS=3  PI_HANDOFF_DIR=<dir>  PI_HANDOFF_DEBUG=1
  */
 
+import { execSync } from "node:child_process";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -27,10 +33,25 @@ import { Injector } from "./injector";
 import { HandoffStore } from "./store";
 import { runRefresh } from "./summarizer";
 
-const THRESHOLD = Math.max(200, Number(process.env.PI_HANDOFF_THRESHOLD_CHARS ?? 2_000) || 2_000);
+/** Character ceiling: force an early refresh once this many new chars accumulate,
+ * even before the turn backstop fires — a safety valve for heavy/monster turns. */
+const CHAR_THRESHOLD = Math.max(200, Number(process.env.PI_HANDOFF_THRESHOLD_CHARS ?? 8_000) || 8_000);
+/** Turn backstop: auto-refresh every this many turns. 0 disables it (chars only). */
+const TURN_THRESHOLD = (() => {
+	const n = Math.floor(Number(process.env.PI_HANDOFF_THRESHOLD_TURNS ?? 3));
+	return Number.isFinite(n) && n >= 0 ? n : 3;
+})();
 const REFRESH_TIMEOUT_MS = 120_000;
 /** Max wait for an in-flight refresh to settle on shutdown (abort fires first; this is a backstop). */
 const SHUTDOWN_GRACE_MS = 2_000;
+
+/** True when enough un-folded work has accumulated to justify an auto-refresh:
+ * every TURN_THRESHOLD turns (the primary cadence) or CHAR_THRESHOLD chars
+ * (a safety valve that fires early on heavy turns). The turn backstop is
+ * disabled when TURN_THRESHOLD=0, leaving only the char ceiling. */
+function shouldAutoRefresh(chars: number, turns: number): boolean {
+	return (TURN_THRESHOLD > 0 && turns >= TURN_THRESHOLD) || chars >= CHAR_THRESHOLD;
+}
 
 type Ctx = ExtensionContext;
 
@@ -43,6 +64,30 @@ function isPidAlive(pid: number): boolean {
 	} catch (e: any) {
 		// ESRCH: no such process → dead. EPERM: exists but no permission → alive.
 		return e?.code === "EPERM";
+	}
+}
+
+/**
+ * Best-effort current git branch of `cwd`. Returns "default" when not in a repo
+ * or on any error, and "detached-<short-sha>" for detached HEAD. Cheap (no FS
+ * walk); called once per turn, so a mid-session `git checkout` is picked up.
+ */
+function detectBranch(cwd: string): string {
+	const run = (args: string) =>
+		execSync(args, { cwd, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 2000 }).trim();
+	try {
+		const out = run("git rev-parse --abbrev-ref HEAD");
+		if (!out || out === "HEAD") {
+			try {
+				const sha = run("git rev-parse --short HEAD");
+				return sha ? `detached-${sha}` : "default";
+			} catch {
+				return "default";
+			}
+		}
+		return out;
+	} catch {
+		return "default";
 	}
 }
 
@@ -62,16 +107,17 @@ export default function piHandoff(pi: ExtensionAPI) {
 	let store: HandoffStore | null = null;
 	let collector: Collector | null = null;
 	let injector: Injector | null = null;
+	/** Git branch the current store is scoped to ("" until session_start). */
+	let currentBranch = "";
 
 	// Refresh queue state — deliberately in-memory only. Persisted lock state
 	// wedges the queue after a crash; every session starts fresh at idle.
 	let busy = false;
-	let dirty = false;
 	let inFlight: Promise<unknown> | null = null;
 	let errors = 0;
 	let lastModel: string | null = null;
 	let resetOfferPending = false;
-	/** AbortController for the currently-running drain; aborted on shutdown so quit is prompt. */
+	/** AbortController for the currently-running drain; aborted on shutdown or a branch switch. */
 	let activeAbort: AbortController | null = null;
 
 	const debug = (msg: string) => {
@@ -91,16 +137,64 @@ export default function piHandoff(pi: ExtensionAPI) {
 		}
 	};
 
-	function status(ctx: Ctx): void {
+	function status(ctx: Ctx, modelOverride?: { name?: string }): void {
 		if (!ctx.hasUI || !store) return;
 		const s = store;
-		const state = busy ? "↻" : s.meta.enabled ? "●" : "○";
+		// Two visible states (plus off): ✓ Synced ↔ ↻ Syncing. A small not-yet-folded
+		// buffer is the normal steady state under ✓ Synced — the next fold fires at
+		// TURN_THRESHOLD turns or CHAR_THRESHOLD chars (→ ↻ Syncing), and repeated
+		// fold failures surface as the trailing ·Nerr badge. pendingChars stays
+		// internal (drives shouldAutoRefresh); exact counts live in `handoff status`.
+		let state: string;
+		if (!s.meta.enabled) state = "○ off";
+		else if (busy) state = "↻ Syncing";
+		else state = "✓ Synced";
 		const err = errors > 0 ? ` · ${errors}err` : "";
-		const model = lastModel ? ` · ${lastModel.split("/").pop()}` : "";
-		ctx.ui.setStatus(
-			"pi-handoff",
-			`handoff ${state} ev ${s.meta.nextSeq - 1} · ${kb(fsSize(s.handoffPath))} · pend ${kb(s.pendingChars)}${model}${err}`,
-		);
+		const branch = currentBranch || "default";
+		const model = modelOverride?.name ?? ctx.model?.name ?? "no-model";
+		ctx.ui.setStatus("pi-handoff", `[Handoff] ${model} ${state} branch:${branch}${err}`);
+	}
+
+	// ----------------------------------------------------- store adoption
+
+	/** Create + init the store for (cwd, branch), wire collector/injector, recompute pending. Returns the store. */
+	function adoptStore(ctx: Ctx, branch: string): HandoffStore {
+		const s = HandoffStore.forCwdAndBranch(ctx.cwd, branch);
+		s.initSync();
+		store = s;
+		currentBranch = branch;
+		// pending chars + turn count derived from durable cursors (survive restarts & branch switches)
+		const since = s.readEventsSince(s.meta.lastRefreshedSeq);
+		s.pendingChars = since.reduce((n, e) => n + (e.excerpts ?? []).reduce((m, x) => m + x.text.length, 0), 0);
+		s.turnsSinceRefresh = since.filter((e) => e.type === "turn_end").length;
+		collector = new Collector(s);
+		injector = new Injector(s);
+		status(ctx);
+		debug(`adoptStore: branch=${branch} root=${s.root} events=${s.meta.nextSeq - 1} pending=${s.pendingChars}`);
+		return s;
+	}
+
+	/** Claim this store as the live owner (on session start and branch switch). */
+	function claimOwnership(sid: string): void {
+		if (!store) return;
+		store.meta.sessionId = sid;
+		store.meta.pid = process.pid;
+		store.meta.endedAt = ""; // we're the live owner now
+		store.saveMetaSync();
+	}
+
+	/** Warn if a different live session is concurrently writing this same store. */
+	function checkConcurrentWriter(ctx: Ctx, sid: string): void {
+		if (!store) return;
+		const prevSid = store.meta.sessionId;
+		// A prior owner that ended gracefully (quit, /new, /resume, /fork, /reload,
+		// or a branch switch) is a sequential handoff, NOT a concurrent writer.
+		if (prevSid && sid && prevSid !== sid && !store.meta.endedAt) {
+			const recent = Date.now() - Date.parse(store.meta.updatedAt || "1970-01-01") < 60_000;
+			if (recent && isPidAlive(store.meta.pid)) {
+				notify(ctx, "pi-handoff: another session updated this handoff <1m ago — concurrent writers share files, last writer wins", "warning");
+			}
+		}
 	}
 
 	// ------------------------------------------------------------- queue
@@ -125,29 +219,32 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	function drain(ctx: Ctx, opts: { force?: boolean; anyPending?: boolean; timeoutMs?: number } = {}): Promise<unknown> | null {
 		if (!store || !store.meta.enabled) return null;
-		if (busy) return inFlight; // coalesce; pending work still tracked via pendingChars
-		const pending = store.pendingChars;
-		const wanted = opts.force ? pending > 0 || !!opts.anyPending : dirty || pending >= THRESHOLD;
+		if (busy) return inFlight; // coalesce; pending work still tracked via pendingChars/turnsSinceRefresh
+		const wanted = opts.force
+			? store.pendingChars > 0 || !!opts.anyPending
+			: shouldAutoRefresh(store.pendingChars, store.turnsSinceRefresh);
 		if (!wanted) return null;
-		dirty = false;
 
+		// Pin the store: a mid-turn branch switch reassigns the outer `store` var,
+		// but an in-flight drain must keep targeting the branch it started on.
+		const s = store;
 		const ac = new AbortController();
 		activeAbort = ac;
 		const p = runExclusive(ctx, async () => {
 			do {
 				try {
-					const r = await runRefresh(store!, modelCtx(ctx), opts.timeoutMs ?? REFRESH_TIMEOUT_MS, ac.signal);
+					const r = await runRefresh(s, modelCtx(ctx), opts.timeoutMs ?? REFRESH_TIMEOUT_MS, ac.signal);
 					if (r?.modelSource) lastModel = r.modelSource;
 					errors = 0; // success → clear any transient error count
 				} catch (e) {
-					// A shutdown abort is not an error — don't poison the error counter.
+					// A shutdown/branch-switch abort is not an error — don't poison the counter.
 					if (!ac.signal.aborted) {
 						errors++;
 						debug(`refresh failed: ${e instanceof Error ? e.message : e}`);
 					}
 					break; // events stay buffered; retried on next trigger
 				}
-			} while (store!.pendingChars >= THRESHOLD && !dirty && !ac.signal.aborted);
+			} while (!ac.signal.aborted && shouldAutoRefresh(s.pendingChars, s.turnsSinceRefresh));
 		});
 		inFlight = p.catch(() => {});
 		void p.finally(() => {
@@ -165,36 +262,12 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("session_start", async (event, ctx) => {
 		try {
-			store = HandoffStore.forCwd(ctx.cwd);
-			store.initSync();
-
 			const sid = ctx.sessionManager.getSessionId?.() ?? "";
-			const prevSid = store.meta.sessionId;
-			// A prior owner that ended gracefully (quit, /new, /resume, /fork, /reload)
-			// is a sequential handoff, NOT a concurrent writer — never warn for it.
-			// Only warn when the prior owner never shut down AND its process is still
-			// alive, i.e. two sessions are genuinely writing the same files at once.
-			if (prevSid && sid && prevSid !== sid && !store.meta.endedAt) {
-				const recent = Date.now() - Date.parse(store.meta.updatedAt || "1970-01-01") < 60_000;
-				if (recent && isPidAlive(store.meta.pid)) {
-					notify(ctx, "pi-handoff: another session updated this handoff <1m ago — concurrent writers share files, last writer wins", "warning");
-				}
-			}
-			// pending chars derived from durable cursors (survives restarts)
-			store.pendingChars = store
-				.readEventsSince(store.meta.lastRefreshedSeq)
-				.reduce((n, e) => n + (e.excerpts ?? []).reduce((m, x) => m + x.text.length, 0), 0);
-			store.meta.sessionId = sid;
-			store.meta.pid = process.pid;
-			store.meta.endedAt = ""; // we're the live owner now
-			store.saveMetaSync();
-
-			collector = new Collector(store);
-			injector = new Injector(store);
-			resetOfferPending = event.reason === "resume" && HandoffStore.hasRealContent(store.readHandoff());
-
-			status(ctx);
-			debug(`session_start: root=${store.root} events=${store.meta.nextSeq - 1} pending=${store.pendingChars}`);
+			const s = adoptStore(ctx, detectBranch(ctx.cwd));
+			checkConcurrentWriter(ctx, sid);
+			claimOwnership(sid);
+			resetOfferPending = event.reason === "resume" && HandoffStore.hasRealContent(s.readHandoff());
+			debug(`session_start: branch=${currentBranch} reason=${event.reason} root=${s.root}`);
 		} catch (e) {
 			debug(`session_start failed: ${e}`);
 		}
@@ -219,6 +292,17 @@ export default function piHandoff(pi: ExtensionAPI) {
 	pi.on("tool_execution_end", async (event) => {
 		try {
 			collector?.onToolEnd(event.toolCallId, event.toolName, event.isError);
+		} catch (e) {
+			debug(String(e));
+		}
+	});
+
+	// Model changed mid-session via /model, Ctrl+P, or session restore — re-render
+	// the bar so the model name stays current. ctx.model may not yet reflect the new
+	// model at event time, so prefer event.model (falls back to ctx.model if absent).
+	pi.on("model_select", async (event, ctx) => {
+		try {
+			status(ctx, event.model);
 		} catch (e) {
 			debug(String(e));
 		}
@@ -323,8 +407,30 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("before_agent_start", async (event, ctx) => {
 		try {
+			// Re-detect the git branch each turn (pi emits no event on `git checkout`);
+			// if it changed, swap to that branch's store before this turn is collected.
+			// before_agent_start fires before the user message_end, so the new
+			// collector captures this turn's prompt (nothing buffered is lost).
+			if (store?.meta.enabled) {
+				const b = detectBranch(ctx.cwd);
+				if (b !== currentBranch) {
+					const sid = ctx.sessionManager.getSessionId?.() ?? "";
+					// Abandon any in-flight refresh on the old branch — its events are
+					// durable in events.jsonl and fold in next time that branch loads.
+					if (activeAbort) activeAbort.abort(new Error("pi-handoff: branch switch"));
+					if (inFlight) await inFlight.catch(() => {});
+					if (store) { store.meta.endedAt = new Date().toISOString(); store.saveMetaSync(); }
+					const s = adoptStore(ctx, b);
+					claimOwnership(sid);
+					checkConcurrentWriter(ctx, sid);
+					// Re-arm the goal-change offer against the new branch's handoff.
+					resetOfferPending = HandoffStore.hasRealContent(s.readHandoff());
+					debug(`branch switch -> ${b} (store ${s.root})`);
+				}
+			}
+
 			if (!resetOfferPending || !store?.meta.enabled || !ctx.hasUI) return;
-			resetOfferPending = false; // offer at most once per session
+			resetOfferPending = false; // offer at most once per branch adoption
 			const prompt = event.prompt ?? "";
 			if (prompt.length < 80) return; // short prompts carry no task signal
 			const goal = extractSection(store.readHandoff(), "Current Goal");
@@ -420,9 +526,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 			ctx,
 			[
 				`pi-handoff — store: ${store.root}`,
+				`  branch: ${currentBranch}`,
 				`  project: ${m.projectPath || ctx.cwd}`,
 				`  enabled: ${m.enabled}   queue: ${busy ? "running" : "idle"}`,
-				`  events: ${m.nextSeq - 1} · pending ${kb(store.pendingChars)} (threshold ${kb(THRESHOLD)})`,
+				`  events: ${m.nextSeq - 1} · pending ${kb(store.pendingChars)} · ${store.turnsSinceRefresh} turns (fold ≥${TURN_THRESHOLD} turns or ≥${kb(CHAR_THRESHOLD)} chars)`,
 				`  handoff.md: ${kb(fsSize(store.handoffPath))} (refreshed at seq ${m.lastRefreshedSeq})`,
 				`  summarizer: ${m.summarizerUsage.calls} calls, ${m.summarizerUsage.totalTokens} tokens${lastModel ? `, last via ${lastModel}` : ""}`,
 			].join("\n"),

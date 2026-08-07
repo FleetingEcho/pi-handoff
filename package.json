@@ -1,8 +1,8 @@
 {
   "name": "pi-handoff",
-  "version": "0.3.5",
+  "version": "0.5.3",
   "type": "module",
-  "description": "Self-maintaining HANDOFF.md per working directory for pi, stored under ~/.pi/agent/pi-handoff.",
+  "description": "Self-maintaining handoff.md per working directory + git branch for pi, stored under ~/.agent/agent-handoff.",
   "license": "MIT",
   "keywords": ["pi-package", "pi", "handoff"],
   "pi": {

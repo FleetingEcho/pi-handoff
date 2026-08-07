@@ -77,7 +77,10 @@ async function callLlm(ctx: ModelCtx, systemPrompt: string, userText: string, ti
 				apiKey: auth.apiKey,
 				headers: auth.headers,
 				env: auth.env,
-				maxTokens: 8192,
+				// Reasoning models burn thinking tokens against this cap; 8192 truncated
+				// folds on such models (finish_reason=length → missing sections → counted
+				// error). Give the call the model's output budget (capped at 32k).
+				maxTokens: Math.max(8192, Math.min(32_768, resolved.model.maxTokens ?? 8192)),
 				signal: ac.signal,
 				cacheRetention: "none",
 				sessionId: uuidv7(),
