@@ -1,260 +1,209 @@
 # pi-handoff
 
-Every project — and each git branch in it — gets a `handoff.md` that keeps itself up to date.
+Persistent working memory for [pi](https://github.com/badlogic/pi-mono): one automatically maintained handoff per git branch, plus shared project knowledge available on every branch.
 
-You never write it, and you never have to remember to update it. As you work, the extension records what happened and periodically asks a model to fold that into a short document: what the goal is, what's done, what was decided, which files matter, what's next. On your next session it is injected into the agent's context automatically — so `pi --resume` (or a brand-new session, or a different agent entirely) starts already knowing where you left off.
-
-No "let me catch you up." No re-explaining the task. No `handoff.md` cluttering your repo.
+The extension records recent turns, periodically folds them into concise Markdown, and injects the result into future sessions. Nothing is written into your repository.
 
 ## Install
 
 Requires pi ≥ 0.83.
 
 ```bash
-pi install git:github.com/FleetingEcho/pi-handoff  # tracks main (recommended — auto-reminds on updates)
+pi install git:github.com/FleetingEcho/pi-handoff
 ```
 
-Start pi and run `/pi-handoff`. You should see a status readout and a `handoff ●` indicator in the status bar. That's the whole setup — there is nothing to configure.
-
-<details>
-<summary>Other install options</summary>
+Restart pi after installing or updating, then run `/pi-handoff` to verify that it loaded.
 
 ```bash
-pi install git:github.com/FleetingEcho/pi-handoff             # track the default branch (auto-reminds on updates)
-pi install -l git:github.com/FleetingEcho/pi-handoff   # this project only (writes .pi/settings.json, commit it to share with teammates)
-pi -e git:github.com/FleetingEcho/pi-handoff                  # try it for one run, install nothing
-pi list                                                       # what's installed
+pi update --extensions  # update an unpinned git install
 pi remove git:github.com/FleetingEcho/pi-handoff
 ```
 
-Pinned git refs are **not** advanced by `pi update --extensions` — re-run `pi install` with the new tag to upgrade.
+## How memory is organized
 
-SSH remotes work too and use your `~/.ssh/config`:
-`pi install git:github.com/FleetingEcho/pi-handoff`
-</details>
+pi-handoff keeps three kinds of memory with different lifetimes:
 
-### Updating
+| Memory | Scope | Purpose |
+|---|---|---|
+| `handoff.md` | Current branch | Goal, progress, decisions, active files, and next steps |
+| Project knowledge | Every branch | Reviewed architecture, conventions, workflows, reusable decisions, and pitfalls |
+| Pinned rules | Every branch | Hard rules and explicit preferences that automated summaries must never rewrite |
 
-pi checks git-sourced extensions at startup (`git ls-remote`) and shows a **Package Updates Available** banner when the remote is ahead of your checkout — run `pi update --extensions`, then **restart pi** to load the new code (extensions load at startup, not live). This check covers the default unpinned install (tracks `main`); a pinned-tag install is skipped by it, so to upgrade one, re-run `pi install git:…@<new-tag>`, then restart. (`PI_OFFLINE=1` disables the check entirely.)
+Each git branch has an independent `handoff.md`. Switching branches switches handoffs automatically. Project knowledge and pins live in `project.md` and are injected on every branch. Outside a git repository, the directory uses one `default` branch.
 
-## Using it
+## Everyday use
 
-### Just work
-
-Open pi in a project and do whatever you were going to do. A background refresh folds recent turns into the document roughly every 3 turns — or sooner if a lot of new material piles up. It runs on your active model, never blocks you, and never interrupts.
-
-The status bar tells you what's going on:
-
-```
-[Handoff] GLM 5.2 ✓ Synced branch:main
-          │        │
-          │        └─ state: ✓ Synced = document current (small not-yet-folded buffer is normal) · ↻ Syncing = refreshing · ○ off
-          └────────── active model — then state — then branch:<git branch> (non-git → "branch:default")
-
-A ` · N err` suffix means the last N background refresh attempts failed (e.g. model error/timeout); it clears on the next successful fold. A large backlog can't hide under ✓ Synced — it triggers ↻ Syncing (and repeated failures surface as ·N err).
-```
-
-### Come back later
+Normally, just work. A background refresh runs roughly every three turns, sooner when a large amount of material accumulates, and before context compaction. Buffered events are durable, so quitting does not need to wait for a model call.
 
 ```bash
-pi --resume     # or just `pi` — a fresh session works the same
-```
-
-The document is injected before your first message, so you can open with "keep going" or "what's left?" and the agent already has the context. Ask it to summarize where things stand and you'll see it reading from the handoff rather than guessing.
-
-### Pin things that must never be forgotten
-
-The summarizer rewrites the document freely — that's how it stays short. Anything you want protected from that goes in the **Pinned** section, which is program-managed and never touched by the model:
-
-```
-/pi-handoff pin Deploys go through ops/deploy.sh, never `make release`
-/pi-handoff pin The staging DB is read-only; ask before any migration
-```
-
-Pinned notes survive every refresh, every clear, **and every branch switch** — they live in `project.md` alongside the branch directories, so a brand-new branch inherits them instead of starting blank. Use them for the standing facts you're tired of repeating. `/pi-handoff unpin <substring>` removes one; `/pi-handoff status` lists them all.
-
-The agent can pin too. It has a `handoff` tool (see [Commands](#commands)) with a written pinning policy in the tool description: pin only what is true on every branch, still true after the current task, and costly to rediscover — test/build commands that aren't obvious, deploy rules, hard prohibitions, stated preferences — and never task progress (the handoff already records that), branch-specific state, things already in `AGENTS.md`/`README`, or secrets. You'll see the tool call in the transcript when it happens.
-
-Forgot to pin while the knowledge was fresh? `/pi-handoff distill` re-reads **every branch's handoff** of this project, drafts candidate standing facts, and walks you through them one by one — nothing lands in `project.md` without your explicit yes.
-
-### Starting a new task
-
-When you move to something unrelated, the accumulated state is noise:
-
-```
-/pi-handoff clear
-```
-
-Fresh document, pinned notes unaffected, and the old version stays recoverable in the event log. If you resume with a prompt that clearly doesn't match the recorded goal, pi-handoff notices and offers this once — it never clears on its own.
-
-### Read or edit it yourself
-
-It's plain Markdown on your disk. `/pi-handoff status` prints the path:
-
-```bash
-/pi-handoff status
-$EDITOR ~/.agent/agent-handoff/-home-zteng-work-Tools-Test/main/handoff.md   # path includes the current branch
-```
-
-Edit it freely — corrections you make are respected by the next refresh, which merges into whatever is currently on disk. (It's a merge, not an append, so the model may still rephrase or drop what it considers finished. Pin anything that must stick.)
-
-### When you want it updated *right now*
-
-```
-/pi-handoff flush
-```
-
-Useful before closing a laptop, before a risky operation, or when you want the document current before handing the machine to someone else. Normally you don't need it — refreshes also run before context compaction, and buffered events fold at the start of the next session if you quit.
-
-### Turning it off
-
-```
-/pi-handoff off     # stops collecting, refreshing, and injecting for this session
+/pi-handoff status       # paths, pending events, usage, and project suggestions
+/pi-handoff flush        # update the current branch handoff immediately
+/pi-handoff clear        # start a fresh branch handoff for a new task
+/pi-handoff off          # disable collection, refresh, and injection
 /pi-handoff on
 ```
 
-## What the document looks like
+On the next session, start with “keep going” or “what’s left?”; the previous branch handoff is already in context.
 
-Seven fixed sections, terse bullets, references to files rather than copies of them:
+The status bar shows the active model, synchronization state, branch, and pending project suggestions:
 
-```markdown
-# Current Goal
-Move the memory store to ~/.pi/agent/pi-handoff and cut the layout to 3 files.
-
-# Progress
-- store.ts rewritten: HandoffStore, path-based slug, snapshots as events
-- MEMORY.md and the distill/promote commands removed
-- typecheck clean; lifecycle + trimming smoke-tested
-
-# Decisions
-- Directory name = absolute path with `/` → `-`; no hash needed, collisions impossible
-- Old doc versions live in events.jsonl as `snapshot` records, not loose files
-- Event log trims by BYTES (a line-count trim silently no-ops on large records)
-
-# Constraints
-- Never write anything into the user's project directory
-- A pending refresh must never lose its input events
-
-# Open Questions
-- Rename the repo folder + GitHub remote from pi-mem?
-
-# Active Files
-- store.ts — persistence, slug, trimming
-- summarizer.ts — the refresh LLM call
-- index.ts — lifecycle wiring and commands
-
-# Next Steps
-- Commit; then `mv ~/work/Tools/pi-mem ~/work/Tools/pi-handoff`
+```text
+[Handoff] GLM 5.2 ✓ Synced branch:main
+[Handoff] GLM 5.2 ↻ Syncing branch:feature/auth
+[Handoff] GLM 5.2 ✓ Synced branch:main · 3 project
 ```
 
-Budget is ~24 000 characters. If a refresh overshoots, the model gets one compression pass, then a hard truncation as a backstop.
+- Model name: the active model used by the session.
+- `✓ Synced`: no handoff refresh is currently running.
+- `↻ Syncing`: the branch handoff is being refreshed.
+- `○ off`: the extension is disabled.
+- `branch:<name>`: the active handoff branch; non-git directories use `default`.
+- `· N project`: N project-knowledge suggestions are awaiting review; hidden when zero.
 
-## Where it lives
+## Shared project knowledge
 
-**Outside your project** — nothing is written into the repo, so there's nothing to gitignore and no risk of committing working state:
-
-```
-~/.agent/agent-handoff/-home-zteng-work-Tools-Test/
-├── project.md          standing pinned rules — shared by every branch
-└── <branch>/
-    ├── handoff.md      the document
-    ├── events.jsonl    append-only log; also holds previous versions
-    └── meta.json       cursors, telemetry, which project/branch this is
-```
-
-**Two tiers, because the content has two lifetimes.** Task state — goal, progress, next steps — is per-branch; that isolation is the point. Standing rules are per-*project*: true no matter which branch you're on, so pins live one level up and a brand-new branch inherits them instead of starting blank.
-
-The project root becomes the container; **each git branch gets its own subdirectory** (and its own `handoff.md`), so switching branches switches handoffs — work on `feature/auth` and `fix/bug-12` stays separate, but your pins follow you everywhere. A non-git directory uses a single `default` branch. The branch is detected at session start and re-checked at the start of every turn, so a mid-session `git checkout` swaps to that branch's handoff immediately.
-
-The container is named after the **project root's** absolute path with `/` folded to `-` — the git repo/worktree top-level when you're inside a repo, so `pi` opened from any subdirectory of the same repo lands on the same store (same handoffs, same pins); outside git, the working directory itself is the key (a plain directory tree keeps per-directory stores; there's no better identity). Two repos can never collide, and you can tell at a glance which store belongs to what. Symlinked checkouts resolve to one store. Set `PI_HANDOFF_DIR` to keep the stores somewhere else. Older layouts migrate automatically on first run: stores under `~/.pi/agent/pi-handoff/`, pre-v0.4.0 flat stores (with `handoff.md` directly in the container), and pre-v0.9.0 cwd-keyed stores (you opened from a subdirectory) carry forward to the repo-root container — never clobbering an existing one.
-
-**Recovering an earlier version** — old documents are `snapshot` records in the log rather than loose files:
+Run a project refresh when several branches have accumulated useful experience:
 
 ```bash
-STORE=~/.agent/agent-handoff/-home-zteng-work-Tools-Test/main
-grep '"snapshot"' "$STORE/events.jsonl" | tail -1 | jq -r .doc     # the version before the last refresh
+/pi-handoff project refresh
+/pi-handoff project          # review queued suggestions
 ```
 
-**Sharing one** — copy it into the repo deliberately:
+`refresh` only calls the model after a branch handoff changes. Changed branches are scanned in bounded batches; each successful batch is checkpointed, so a later failure never marks unprocessed branches as scanned. Deleted/archived Git branch stores are skipped by default; use `/pi-handoff project refresh all` when you deliberately want to mine them too. Candidates may add knowledge or replace/remove facts made stale by newer branch evidence. `/pi-handoff project` (or the explicit `/pi-handoff project review`) shows the exact change, evidence, and source branches before applying it to `project.md`.
+
+You can also manage knowledge directly:
 
 ```bash
-cp "$STORE/handoff.md" docs/handoff.md && git add docs/handoff.md
+/pi-handoff project status
+/pi-handoff project add Prefer small atomic store mutations
+/pi-handoff project add Architecture: Events are the durable source of pending work
+/pi-handoff project forget atomic store
 ```
 
-For rules that should apply on *every* run rather than to the current task, use the project's `AGENTS.md` instead — every agent reads it every time.
+Direct additions default to `Conventions`. Available sections are:
+
+- `Project Overview`
+- `Architecture`
+- `Conventions`
+- `Workflows`
+- `Decisions and Rationale`
+- `Known Pitfalls`
+
+The agent-facing `handoff` tool can queue ordinary project knowledge with `project_propose`. Proposals still require user review.
+
+## Pinned rules
+
+Pins are the protected tier. Use them for hard constraints that should never be rephrased or removed automatically:
+
+```bash
+/pi-handoff pin Deploys go through ops/deploy.sh, never make release
+/pi-handoff pin The staging database is read-only
+/pi-handoff unpin staging database
+```
+
+Do not pin current task progress, branch-specific state, duplicated documentation, or secrets. Those either belong in the branch handoff or should not be stored.
 
 ## Commands
 
-| Command | What it does |
+| Command | Purpose |
 |---|---|
-| `/pi-handoff` or `/pi-handoff status` | Store path, event count, doc size, cursors, summarizer token usage |
-| `/pi-handoff flush` | Refresh handoff.md right now |
-| `/pi-handoff pin <note>` | Record a standing project rule — never rewritten, applies on **every branch**. Re-pinning is a no-op |
-| `/pi-handoff unpin <substring>` | Remove a pin. An ambiguous match removes nothing and lists the candidates |
-| `/pi-handoff distill` | Scan every branch's handoff of this project and offer the standing facts as pins — reviewed one by one, never auto-written |
-| `/pi-handoff clear` | Fresh document for a new task (pins are unaffected; old version recoverable) |
-| `/pi-handoff on` / `/pi-handoff off` | Toggle collection, refresh, and injection |
+| `/pi-handoff [status]` | Show store, branch, queue, usage, pins, and project suggestions |
+| `/pi-handoff flush` | Refresh the current branch handoff now |
+| `/pi-handoff clear` | Start a fresh task handoff; project knowledge and pins remain |
+| `/pi-handoff project status` | Show shared knowledge and pending suggestions |
+| `/pi-handoff project refresh [all]` | Extract from active branches; `all` includes archived/deleted stores |
+| `/pi-handoff project` or `project review` | Accept or reject queued candidates |
+| `/pi-handoff project add [Section:] <fact>` | Add shared knowledge directly |
+| `/pi-handoff project forget <substring>` | Remove one shared fact; ambiguous matches remove nothing |
+| `/pi-handoff pin <rule>` | Add a protected project-wide rule |
+| `/pi-handoff unpin <substring>` | Remove one pin; ambiguous matches remove nothing |
+| `/pi-handoff on` / `off` | Enable or disable the extension for this session |
 
-The agent gets the same memory as a **tool** named `handoff` with actions `status` | `flush` | `pin` | `unpin`. `clear`, `on`, and `off` stay user-only — the agent may curate memory but never wipe it or switch it off. The guardrails are program-side regardless of who writes: re-pinning an existing note is a no-op, an ambiguous unpin removes nothing, and the summarizer never rewrites pins.
+The agent tool supports `status`, `flush`, `project_propose`, `pin`, and `unpin`. Destructive controls such as `clear` and `off` remain user-only.
 
-Also ships a `/skill:write-handoff` skill for when you want a handoff written by hand — tailored to a specific next session, rather than the rolling automatic one.
+## Storage
 
+All files live outside the project:
+
+```text
+~/.agent/agent-handoff/<project>/
+├── project.md                 shared knowledge and pinned rules
+├── project-candidates.json    suggestion and review state
+├── project-meta.json          per-branch project-scan revisions
+└── <branch>/
+    ├── handoff.md             current branch handoff
+    ├── events.jsonl           durable events and document snapshots
+    └── meta.json              cursors and session metadata
+```
+
+The project key uses the git repository root, so launching pi from different subdirectories reaches the same store. Symlinked paths are resolved, sanitized-name collisions are disambiguated, and older layouts migrate automatically. Set `PI_HANDOFF_DIR` to use another storage root.
+
+The branch document contains seven fixed sections: Current Goal, Progress, Decisions, Constraints, Open Questions, Active Files, and Next Steps. It is capped at roughly 24,000 characters while preserving all section headings.
+
+Shared project knowledge is capped at roughly 16,000 characters because it is injected on every request. When it approaches the limit, replace or remove stale facts before adding more; protected pins use a separate section.
+
+### Storage limits
+
+| File/content | Limit | Cleanup behavior |
+|---|---:|---|
+| `handoff.md` | 24k characters / 96 KB | Oversized model output is compacted by section; oversized writes are rejected |
+| Project knowledge | 16k characters | Existing oversized sections are compacted; new facts are rejected at the limit |
+| Pinned rules | 200 rules, 500 characters each, 16k total | New pins are rejected; legacy duplicate/overflow pins are removed with a marker |
+| `project.md` | 128 KB | Enforced on every atomic write |
+| `events.jsonl` | 1,000 lines / 4 MB | Trims toward 900 lines / 2 MB; pending overflow leaves a summarizer-visible marker |
+| `project-candidates.json` | 200 pending + 500 reviewed, 240 characters per field, 1 MB | Oldest excess candidates are removed automatically |
+| `project-meta.json` | 2,000 branch hashes / 2 MB | Oldest scan hashes are removed automatically |
+| branch `meta.json` | 32 KB | Unknown fields are discarded and known values are normalized on startup |
+
+A collected turn contributes at most about 12k excerpt characters and 200 changed-file paths.
+
+## Reliability and privacy
+
+- Events are appended synchronously before background summarization.
+- Document and metadata replacements use unique temporary files plus atomic rename.
+- Short-lived filesystem locks coordinate event, metadata, project knowledge, and proposal writes across pi processes; model calls never hold a lock.
+- A background refresh refuses to overwrite a handoff edited while its model call was running.
+- Refresh cursors only advance past events actually sent to the model.
+- Project extraction checkpoints only branch batches actually processed by the model.
+- Events arriving during a refresh remain pending for the next batch.
+- `events.jsonl` is bounded to 1,000 lines and 4 MB. Trimming prefers folded history; if pending history alone exceeds the hard limit, the newest records are retained with an explicit overflow marker for the summarizer.
+- Secret denylist redaction runs before excerpts touch disk, before model calls, and on model output. It is a safeguard, not a guarantee; never intentionally place secrets in handoffs or pins.
+- Malformed JSONL tail records are ignored rather than breaking startup.
+
+Two sessions on different branches are isolated. Sessions on the same branch coordinate short disk transactions with filesystem locks; competing summaries use revision checks and retry rather than overwriting a newer document. pi-handoff still warns when it detects another live owner because simultaneous agents may produce noisier combined task history.
 
 ## Troubleshooting
 
-**The document isn't updating.** Check `/pi-handoff status`: if `pending` is below the threshold, nothing has accumulated yet — that's normal. If `enabled` is false, run `/pi-handoff on`. Otherwise run `PI_HANDOFF_DEBUG=1 pi` and watch stderr; refreshes use your active model, so auth issues are the same ones you'd hit chatting — if a refresh fails the events simply stay buffered until the next attempt.
+**The handoff is not updating.** Check `/pi-handoff status`. A small pending buffer is normal. If refreshes fail, run with `PI_HANDOFF_DEBUG=1`; authentication is inherited from the active pi model.
 
-**It didn't refresh when I quit.** By design it doesn't — quitting aborts any in-flight refresh (with a 2s backstop) so exit stays prompt. Normally nothing is lost: buffered events are durable in `events.jsonl` and merged at the start of the next session. By default the log is kept across restarts (the 4 MB in-place trim still bounds it); set `PI_HANDOFF_EXIT_CLEAR_LINES` to a positive number (e.g. 500) to wipe it on exit for a clean slate, in which case not-yet-refreshed events would be lost. The default is off because the store is shared with other agents (e.g. opencode-handoff).
+**Quitting did not refresh.** This is intentional. In-flight work is aborted promptly, while buffered events remain in `events.jsonl` and are folded during a later session.
 
-**Two pi sessions in the same directory.** Sessions on the *same git branch* share one store and the last writer wins (with a startup warning only if the other session is still running). Sessions on *different branches* are fully isolated — that's the point of per-branch stores. Quitting and immediately starting a new session (or an in-process `/new`, `/resume`, `/fork`, `/reload`) is recognized as a sequential handoff and stays quiet.
+**The content is stale or wrong.** Edit the Markdown directly, run `/pi-handoff clear` for a new task, or use `project forget` for incorrect shared knowledge. Pin only corrections that must remain permanent.
 
-**Working outside a git repo.** Everything works — the store is keyed by the directory path itself and lives on a single `default` branch; pins, flush, clear, distill all behave the same. If the directory *later* becomes a repo (via `git init` there or in any parent), nothing changes mid-session: the project identity is resolved once per session, so the new repo identity takes effect on the next session start — and the existing directory-keyed store is carried forward to the repo-root container automatically, never blank.
+**I need an older handoff.** Previous documents are stored as `snapshot` records in `events.jsonl`:
 
-**I used to open pi from a subdirectory and now my handoff looks empty.** Pre-v0.9.0 stores were keyed by the exact launch directory, so `/repo/a/b` and `/repo` were different projects. On first open with v0.9.0+, a launch-directory-keyed store carries forward to the repo-root container — but if you historically opened from *several* different subdirectories of one repo, only the first-seen store migrates (merging could collide branch dirs); the rest stay on disk next to it, orphaned but intact. Run `/pi-handoff distill` from the repo to rescue standing facts from any orphaned handoffs into pinned rules.
-
-**The document has stale or wrong information.** Edit the file directly, or `/pi-handoff clear` for a clean slate. To make a correction permanent, `/pi-handoff pin` it.
-
-## How it works
-
-```
-git checkout ────► swap stores    branch detected at session start + each turn
-turn_end ────────► events.jsonl   redacted excerpts, no LLM, deterministic
-agent_settled ───► handoff.md     background merge once enough is pending
-every LLM call ──► injected into context (non-destructive, never persisted)
+```bash
+grep '"snapshot"' /path/to/events.jsonl | tail -1 | jq -r .doc
 ```
 
-Refreshes trigger on `agent_settled` — every `PI_HANDOFF_THRESHOLD_TURNS` turns (default 3), or sooner once `PI_HANDOFF_THRESHOLD_CHARS` (default 8000) of new material accumulates — plus before context compaction and on `/pi-handoff flush`. (Quitting does not flush; buffered events fold at the start of the next session.) A refresh never runs when there is nothing new to fold — opening pi and doing nothing makes no model call.
+## Development
 
-### Safety properties
+```bash
+npm install
+npm run typecheck
+```
 
-- All writes are atomic (temp file + rename); the previous document is recorded into the log before being replaced.
-- The log is trimmed in place past 4 MB, and only records already folded into the document are eligible — a pending refresh never loses its input.
-- On graceful shutdown, the log is wiped for a clean slate if it has reached `PI_HANDOFF_EXIT_CLEAR_LINES` records — default 0 (off), since the store is shared with other agents (e.g. opencode-handoff) and wiping it would discard events they still need; set it to a positive number (e.g. 500) to enable the wipe when you only run one agent.
-- Secrets: denylist redaction runs when excerpts are appended (before touching disk), before LLM calls, and on LLM output. The summarizer prompt refuses secrets and ignores instructions embedded in the material it summarizes.
-- Malformed JSONL lines are tolerated (crash-safe tail); queue state is in-memory only, so a crash can't wedge it.
-- Injection is non-destructive and never written into session files.
+The pi runtime packages are optional peer dependencies: pi resolves them when loading the extension without installing a second runtime copy. For local type checking, make those package types available from the installed pi runtime or install them temporarily without saving.
 
-## Develop
-
-That location is auto-discovered by pi in all projects. After edits: `/reload`. Quick isolated test: `pi -e ~/.pi/agent/extensions/pi-handoff/index.ts`.
-
-If you also have the git package installed, remove it (`pi remove git:github.com/FleetingEcho/pi-handoff`) — two copies collide on the `/pi-handoff` command and the `write-handoff` skill name.
-
-Loaded as a package, resources come from the `pi` manifest in `package.json` (`extensions: ["./index.ts"]`, `skills: ["./skills"]`) — a bare `index.ts` at the package root is *not* auto-discovered.
+Main files:
 
 | File | Role |
 |---|---|
-| `index.ts` | Lifecycle wiring, refresh queue, commands, agent `handoff` tool |
-| `collector.ts` | pi events → redacted, bounded records (no judgment) |
-| `summarizer.ts` | Model resolution + the refresh and distill calls |
-| `injector.ts` | Puts the document into context on every request |
-| `store.ts` | Paths, project-key migration, branch scan, atomic writes, event log, trimming |
+| `index.ts` | Lifecycle, refresh queue, commands, and agent tool |
+| `store.ts` | Paths, migrations, project knowledge, events, and atomic persistence |
+| `collector.ts` | Deterministic redacted turn collection |
+| `summarizer.ts` | Branch refresh and project-knowledge extraction |
+| `injector.ts` | Branch and project context injection |
 | `redact.ts` | Secret denylist |
 
-### Editor / types
-
-Pi's imports are resolved by pi at runtime (jiti) — nothing is required to *run* this extension. For intellisense and type checking, this dir contains symlinks in `node_modules/@earendil-works/*` pointing at the globally installed pi packages (so types always match the running pi version), `@types/node` as a devDependency, and a `tsconfig.json` with `moduleResolution: Bundler` to match jiti's extensionless imports.
-
-```bash
-bun run typecheck
-```
+The package also includes `/skill:write-handoff` for manually writing a handoff to a user-selected path.

@@ -25,13 +25,14 @@
  * and on/off stay user-only (slash commands); the agent may curate memory but
  * never wipe it.
  *
- * Commands: /pi-handoff status|flush|pin|unpin|distill|clear|on|off
+ * Commands: /pi-handoff status|flush|project|pin|unpin|clear|on|off
  * Tool:     handoff(status|flush|pin|unpin) — agent-callable
  * Env:      PI_HANDOFF_MODEL=provider/id  PI_HANDOFF_THRESHOLD_CHARS=8000
  *           PI_HANDOFF_THRESHOLD_TURNS=3  PI_HANDOFF_DIR=<dir>  PI_HANDOFF_DEBUG=1
  */
 
 import { execSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -41,18 +42,25 @@ import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type Exten
 import { Type } from "typebox";
 import { Collector } from "./collector";
 import { Injector } from "./injector";
-import { HandoffStore, listBranchDocs, migrateProjectKey } from "./store";
-import { runDistill, runRefresh } from "./summarizer";
+import { redact } from "./redact";
+import { HandoffStore, PROJECT_KNOWLEDGE_CAP_CHARS, PROJECT_SECTIONS, listBranchDocs, migrateProjectKey, type ProjectCandidate, type ProjectSection } from "./store";
+import { runProjectExtraction, runRefresh } from "./summarizer";
 
 /** Character ceiling: force an early refresh once this many new chars accumulate,
  * even before the turn backstop fires — a safety valve for heavy/monster turns. */
-const CHAR_THRESHOLD = Math.max(200, Number(process.env.PI_HANDOFF_THRESHOLD_CHARS ?? 8_000) || 8_000);
+const CHAR_THRESHOLD = (() => {
+	const n = Number(process.env.PI_HANDOFF_THRESHOLD_CHARS ?? 8_000);
+	return Number.isFinite(n) ? Math.max(200, Math.floor(n)) : 8_000;
+})();
 /** Turn backstop: auto-refresh every this many turns. 0 disables it (chars only). */
 const TURN_THRESHOLD = (() => {
 	const n = Math.floor(Number(process.env.PI_HANDOFF_THRESHOLD_TURNS ?? 3));
 	return Number.isFinite(n) && n >= 0 ? n : 3;
 })();
 const REFRESH_TIMEOUT_MS = 120_000;
+/** Each handoff contributes at most 8k chars to extraction; five stay below the
+ * 48k model-input cap with room for existing knowledge and prompt framing. */
+const PROJECT_SCAN_BRANCHES_PER_BATCH = 5;
 /** Max wait for an in-flight refresh to settle on shutdown (abort fires first; this is a backstop). */
 const SHUTDOWN_GRACE_MS = 2_000;
 
@@ -120,7 +128,7 @@ export function resolveProjectRoot(cwd: string): string {
  * making its handoff look blank. `refs/heads/<name>` is identical in both
  * states, so we strip the prefix ourselves.
  */
-export function detectBranch(cwd: string): string {
+export function detectBranch(cwd: string, fallback = "default"): string {
 	const run = (args: string) =>
 		execSync(args, { cwd, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 2000 }).trim();
 	try {
@@ -137,12 +145,38 @@ export function detectBranch(cwd: string): string {
 		// detached HEAD
 		try {
 			const sha = run("git rev-parse --short HEAD");
-			return sha ? `detached-${sha}` : "default";
+			return sha ? `detached-${sha}` : fallback;
 		} catch {
-			return "default";
+			return fallback;
 		}
 	} catch {
-		return "default";
+		// A transient git failure must not make a live session jump into the
+		// non-git store. At session start the fallback is still "default".
+		return fallback;
+	}
+}
+
+/** Current local and remote branch names. Null means detection failed, so
+ * callers must not filter durable stores on uncertain evidence. */
+function activeGitBranches(cwd: string): Set<string> | null {
+	try {
+		const refs = execSync("git for-each-ref --format=%(refname) refs/heads refs/remotes", {
+			cwd,
+			stdio: ["ignore", "pipe", "ignore"],
+			encoding: "utf8",
+			timeout: 3_000,
+		});
+		const branches = new Set<string>();
+		for (const ref of refs.split("\n").map((line) => line.trim()).filter(Boolean)) {
+			if (ref.startsWith("refs/heads/")) branches.add(ref.slice("refs/heads/".length));
+			else if (ref.startsWith("refs/remotes/")) {
+				const name = ref.slice("refs/remotes/".length).replace(/^[^/]+\//, "");
+				if (name && name !== "HEAD") branches.add(name);
+			}
+		}
+		return branches;
+	} catch {
+		return null;
 	}
 }
 
@@ -197,17 +231,17 @@ export default function piHandoff(pi: ExtensionAPI) {
 		const s = store;
 		// Two visible states (plus off): ✓ Synced ↔ ↻ Syncing. A small not-yet-folded
 		// buffer is the normal steady state under ✓ Synced — the next fold fires at
-		// TURN_THRESHOLD turns or CHAR_THRESHOLD chars (→ ↻ Syncing), and repeated
-		// fold failures surface as the trailing ·Nerr badge. pendingChars stays
-		// internal (drives shouldAutoRefresh); exact counts live in `handoff status`.
+		// TURN_THRESHOLD turns or CHAR_THRESHOLD chars (→ ↻ Syncing). pendingChars
+		// stays internal (drives shouldAutoRefresh); exact counts live in status.
 		let state: string;
 		if (!s.meta.enabled) state = "○ off";
 		else if (busy) state = "↻ Syncing";
 		else state = "✓ Synced";
-		const err = errors > 0 ? ` · ${errors}err` : "";
+		const projectSuggestions = s.readProjectCandidates().filter((c) => c.status === "suggested").length;
+		const projectBadge = projectSuggestions > 0 ? ` · ${projectSuggestions} project` : "";
 		const branch = currentBranch || "default";
 		const model = modelOverride?.name ?? ctx.model?.name ?? "no-model";
-		ctx.ui.setStatus("pi-handoff", `[Handoff] ${model} ${state} branch:${branch}${err}`);
+		ctx.ui.setStatus("pi-handoff", `[Handoff] ${model} ${state} branch:${branch}${projectBadge}`);
 	}
 
 	// ----------------------------------------------------- store adoption
@@ -251,7 +285,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (prevSid && sid && prevSid !== sid && !store.meta.endedAt) {
 			const recent = Date.now() - Date.parse(store.meta.updatedAt || "1970-01-01") < 60_000;
 			if (recent && isPidAlive(store.meta.pid)) {
-				notify(ctx, "pi-handoff: another session updated this handoff <1m ago — concurrent writers share files, last writer wins", "warning");
+					notify(ctx, "pi-handoff: another live session shares this branch handoff — writes are coordinated, but refreshes may retry when the document changes", "warning");
 			}
 		}
 	}
@@ -297,9 +331,11 @@ export default function piHandoff(pi: ExtensionAPI) {
 			else opts.signal.addEventListener("abort", () => ac.abort(opts.signal!.reason), { once: true });
 		}
 		const p = runExclusive(ctx, async () => {
+			let batchRemaining = false;
 			do {
 				try {
 					const r = await runRefresh(s, modelCtx(ctx), opts.timeoutMs ?? REFRESH_TIMEOUT_MS, ac.signal);
+					batchRemaining = !!r?.remaining;
 					if (r?.modelSource) lastModel = r.modelSource;
 					errors = 0; // success → clear any transient error count
 				} catch (e) {
@@ -310,7 +346,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 					}
 					break; // events stay buffered; retried on next trigger
 				}
-			} while (!ac.signal.aborted && shouldAutoRefresh(s.pendingChars, s.turnsSinceRefresh));
+			} while (!ac.signal.aborted && (shouldAutoRefresh(s.pendingChars, s.turnsSinceRefresh) || (!!opts.force && batchRemaining)));
 		});
 		inFlight = p.catch(() => {});
 		void p.finally(() => {
@@ -336,6 +372,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 			debug(`session_start: branch=${currentBranch} reason=${event.reason} root=${s.root}`);
 		} catch (e) {
 			debug(`session_start failed: ${e}`);
+			notify(ctx, `pi-handoff failed to initialize: ${e instanceof Error ? e.message : e}`, "error");
 		}
 	});
 
@@ -478,7 +515,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 			// before_agent_start fires before the user message_end, so the new
 			// collector captures this turn's prompt (nothing buffered is lost).
 			if (store?.meta.enabled) {
-				const b = detectBranch(ctx.cwd);
+				const b = detectBranch(ctx.cwd, currentBranch || "default");
 				if (b !== currentBranch) {
 					const sid = ctx.sessionManager.getSessionId?.() ?? "";
 					// Abandon any in-flight refresh on the old branch — its events are
@@ -569,19 +606,21 @@ export default function piHandoff(pi: ExtensionAPI) {
 			name: "handoff",
 			label: "Handoff",
 			description:
-				"Inspect and curate this project's persistent memory (handoff.md per branch + project.md standing rules shared by every branch and by other agents). " +
-				"Actions: 'status' (stats, store path, current pins), 'flush' (force a handoff.md refresh now — costs one background model call; rarely needed, e.g. before a risky operation), 'pin' (record a standing project rule — requires 'note'), 'unpin' (remove one — 'note' is a substring match; an ambiguous match removes nothing and lists the candidates). " +
-				"WHEN TO PIN, on your own initiative: you are encouraged to pin without being asked when you learn something GENERAL about this project — true on every branch, still true after the current task, and costly to rediscover. Good pins: the actual command to run tests or the dev server when it is not obvious; where a shared library/component lives; deploy and release rules; hard prohibitions ('never edit src/generated/'); a stated user preference about how to work in this repo. " +
+				"Inspect and curate persistent memory: handoff.md is branch task state; project.md contains reviewed project-wide knowledge plus protected pinned rules. " +
+				"Actions: 'status', 'flush', 'project_propose' (queue durable project knowledge for user review; requires note, optional section), 'pin' (record a hard standing rule), and 'unpin'. " +
+				"Use project_propose for reusable architecture, conventions, workflows, decisions with rationale, and recurring pitfalls. It need not have appeared on every branch, but must remain useful after the current task and must not be branch-specific. " +
+				"Use pin only for hard constraints or explicit user preferences that must never be rewritten: deploy rules, hard prohibitions, or critical non-obvious commands. " +
 				"Do NOT pin: anything about the current task or its progress (the handoff records that automatically), anything specific to one branch, one-off decisions, transient state, anything already stated in AGENTS.md/CLAUDE.md/README (it is already in your context), or secrets. " +
 				"Pins are permanent, apply to every branch, and are never rewritten by the summarizer — so prefer one durable sentence over a running commentary, and when in doubt, do not pin. Re-pinning an existing note is a no-op.",
-			promptSnippet: "Inspect and curate persistent project memory (pins shared across branches)",
+			promptSnippet: "Inspect branch memory and propose durable project-wide knowledge",
 			promptGuidelines: [
-				"When you learn a durable project fact — true on every branch and worth knowing after the current task — record it with the handoff tool (action: 'pin'). Do not pin task progress; the handoff records that automatically.",
+				"When you learn durable project-wide knowledge worth retaining after the current task, queue it with action=project_propose. Reserve action=pin for hard rules that must never be rewritten.",
 			],
 			parameters: Type.Object({
-				action: StringEnum(["status", "flush", "pin", "unpin"], {
-					description: "status = inspect; flush = merge pending events into handoff.md now; pin = record a standing project rule; unpin = remove one by substring",
+				action: StringEnum(["status", "flush", "project_propose", "pin", "unpin"], {
+					description: "status = inspect; flush = refresh branch handoff; project_propose = queue shared knowledge for review; pin/unpin = manage protected rules",
 				}),
+				section: Type.Optional(StringEnum(PROJECT_SECTIONS, { description: "project.md section for action=project_propose; defaults to Conventions" })),
 				note: Type.Optional(
 					Type.String({
 						description: "For action=pin: the standing project rule to record (applies on every branch). For action=unpin: a substring identifying which pin to remove.",
@@ -595,6 +634,27 @@ export default function piHandoff(pi: ExtensionAPI) {
 				switch (params.action) {
 					case "status":
 						return txt(statusText(ctx.cwd) ?? "pi-handoff: not initialized");
+					case "project_propose": {
+						const statement = params.note ? redact(params.note.replace(/\s+/g, " ").trim()).slice(0, 240).trim() : "";
+						if (!statement) return txt("handoff: action=project_propose requires a 'note'");
+						const id = createHash("sha256").update(statement.toLowerCase()).digest("hex").slice(0, 16);
+						const candidates = s.readProjectCandidates();
+						if (candidates.some((c) => c.id === id) || s.readProjectKnowledge().toLowerCase().includes(statement.toLowerCase()))
+							return txt("pi-handoff: project knowledge already recorded or proposed — no change");
+						candidates.push({
+							id,
+							section: (params.section as ProjectSection | undefined) ?? "Conventions",
+							statement,
+							evidence: "Proposed by the active agent from current work; awaiting user review.",
+							branches: [currentBranch || "default"],
+							createdAt: new Date().toISOString(),
+							status: "suggested",
+							action: "add",
+						});
+						s.saveProjectCandidates(candidates);
+						status(ctx);
+						return txt(`Queued project knowledge for user review under ${(params.section as string | undefined) ?? "Conventions"}.`);
+					}
 					case "pin": {
 						if (!params.note?.trim()) return txt("handoff: action=pin requires a 'note'");
 						if (!s.appendPinned(params.note)) return txt(`pi-handoff: already pinned — no change. Current pins:\n${s.pinnedNotes().join("\n") || "(none)"}`);
@@ -623,7 +683,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 					default:
 						// StringEnum widens to string in the type system; the schema
 						// constrains runtime values, so this is unreachable.
-						return txt(`handoff: unknown action "${params.action}" — try status|flush|pin|unpin`);
+						return txt(`handoff: unknown action "${params.action}" — try status|flush|project_propose|pin|unpin`);
 				}
 			},
 		}),
@@ -636,14 +696,14 @@ export default function piHandoff(pi: ExtensionAPI) {
 		["flush", "Force a handoff.md refresh now"],
 		["pin", "Record a standing project rule (applies on every branch)"],
 		["unpin", "Remove a pinned rule by substring match"],
-		["distill", "Scan every branch's handoff and pin the standing facts"],
+		["project", "Manage project-wide knowledge (status|refresh|review|add|forget)"],
 		["clear", "Start a fresh handoff for a new task (pins are kept)"],
 		["on", "Enable pi-handoff"],
 		["off", "Disable pi-handoff"],
 	] as const;
 
 	pi.registerCommand("pi-handoff", {
-		description: "pi-handoff: self-maintaining handoff.md (status|flush|pin|unpin|distill|clear|on|off)",
+		description: "pi-handoff: branch handoff + shared project knowledge (status|flush|project|pin|unpin|clear|on|off)",
 		getArgumentCompletions: (prefix: string) =>
 			SUBCOMMANDS.filter(([name]) => name.startsWith(prefix)).map(([value, label]) => ({ value, label })),
 		handler: async (args, ctx: ExtensionCommandContext) => {
@@ -659,8 +719,8 @@ export default function piHandoff(pi: ExtensionAPI) {
 						return cmdPin(ctx, text);
 					case "unpin":
 						return cmdUnpin(ctx, text);
-					case "distill":
-						return await cmdDistill(ctx);
+					case "project":
+						return await cmdProject(ctx, rest);
 					case "clear":
 						return await cmdReset(ctx);
 					case "on":
@@ -685,9 +745,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 			`  branch: ${currentBranch}`,
 			`  project: ${m.projectPath || cwd}`,
 			`  enabled: ${m.enabled}   queue: ${busy ? "running" : "idle"}`,
-			`  events: ${m.nextSeq - 1} · pending ${kb(store.pendingChars)} · ${store.turnsSinceRefresh} turns (fold ≥${TURN_THRESHOLD} turns or ≥${kb(CHAR_THRESHOLD)} chars)`,
+			`  events: ${m.eventLineCount}/1000 lines · latest seq ${m.nextSeq - 1} · pending ${kb(store.pendingChars)} · ${store.turnsSinceRefresh} turns (fold ≥${TURN_THRESHOLD} turns or ≥${kb(CHAR_THRESHOLD)} chars)`,
 			`  handoff.md: ${kb(fsSize(store.handoffPath))} (refreshed at seq ${m.lastRefreshedSeq})`,
 			`  pinned: ${store.pinnedNotes().length} project-level note(s) in ${store.projectDocPath}`,
+			`  project knowledge: ${store.readProjectKnowledge().split("\n").filter((line) => line.startsWith("- ")).length} fact(s) · ${store.readProjectCandidates().filter((c) => c.status === "suggested").length} suggestion(s)`,
 			...store.pinnedNotes().map((n) => `    ${n}`),
 			`  summarizer: ${m.summarizerUsage.calls} calls, ${m.summarizerUsage.totalTokens} tokens${lastModel ? `, last via ${lastModel}` : ""}`,
 		].join("\n");
@@ -725,53 +786,164 @@ export default function piHandoff(pi: ExtensionAPI) {
 		notify(ctx, `pi-handoff: no pin matches "${text}". Current pins:\n${store.pinnedNotes().join("\n") || "(none)"}`, "warning");
 	}
 
-	/**
-	 * Cross-branch aggregation, the one job the per-branch background refresh
-	 * can't do: read every branch's handoff of this project, draft candidate
-	 * standing facts, and let the USER confirm which become pins. Nothing is
-	 * written without an explicit yes — the trusted tier stays human-gated even
-	 * though the extraction itself is automatic.
-	 */
-	async function cmdDistill(ctx: ExtensionCommandContext): Promise<void> {
+	async function cmdProject(ctx: ExtensionCommandContext, args: string[]): Promise<void> {
+		const [action = "review", ...rest] = args;
+		const text = rest.join(" ").trim();
+		switch (action) {
+			case "status": return cmdProjectStatus(ctx);
+			case "refresh": return await cmdProjectRefresh(ctx, rest[0] === "all");
+			case "review": return await cmdProjectReview(ctx);
+			case "add": return cmdProjectAdd(ctx, text);
+			case "forget": return cmdProjectForget(ctx, text);
+			default: return notify(ctx, `usage: /pi-handoff project status|refresh|review|add|forget`, "warning");
+		}
+	}
+
+	function cmdProjectStatus(ctx: Ctx): void {
+		if (!store) return;
+		const candidates = store.readProjectCandidates();
+		const suggested = candidates.filter((c) => c.status === "suggested");
+		notify(ctx, [
+			`pi-handoff project — ${store.projectDocPath}`,
+			`  knowledge: ${store.readProjectKnowledge().split("\n").filter((line) => line.startsWith("- ")).length} accepted fact(s)`,
+			`  suggestions: ${suggested.length} awaiting review`,
+			...suggested.slice(0, 8).map((c) => {
+				const action = c.action ?? "add";
+				return action === "replace"
+					? `    [replace/${c.section}] ${c.target} → ${c.statement}`
+					: action === "remove"
+						? `    [remove/${c.section}] ${c.target ?? c.statement}`
+						: `    [add/${c.section}] ${c.statement}`;
+			}),
+		].join("\n"));
+	}
+
+	async function cmdProjectRefresh(ctx: ExtensionCommandContext, includeArchived = false): Promise<void> {
 		if (!store) return;
 		await ctx.waitForIdle();
 		await runExclusive(ctx, async () => {
 			if (!store) return;
-			const docs = listBranchDocs(resolveProjectRoot(ctx.cwd));
-			if (docs.length === 0) return notify(ctx, "pi-handoff: no branch handoffs with content yet — nothing to distill", "warning");
-			const pins = store.pinnedNotes();
-			let res;
-			try {
-				res = await runDistill(docs, pins, modelCtx(ctx), REFRESH_TIMEOUT_MS);
-			} catch (e) {
-				return notify(ctx, `pi-handoff distill failed: ${e instanceof Error ? e.message : e}`, "error");
-			}
-			if (res.candidates.length === 0)
-				return notify(ctx, `pi-handoff: ${docs.length} branch handoff(s) scanned via ${res.modelSource} — no standing facts beyond the ${pins.length} existing pin(s)`);
-			if (!ctx.hasUI) {
-				return notify(ctx, `pi-handoff distill candidates (nothing pinned without review):\n${res.candidates.map((c) => `- ${c}`).join("\n")}`);
-			}
+			const storedDocs = listBranchDocs(resolveProjectRoot(ctx.cwd));
+			const active = includeArchived ? null : activeGitBranches(ctx.cwd);
+			const allDocs = active === null
+				? storedDocs
+				: storedDocs.filter((doc) => doc.branch === currentBranch || doc.branch === "default" || active.has(doc.branch));
+			if (allDocs.length === 0) return notify(ctx, "pi-handoff project: no branch handoff has durable content yet", "warning");
+			const oldHashes = store.projectScanHashes();
+			const nextHashes = { ...oldHashes };
+			const changed = allDocs.filter((doc) => {
+				const hash = createHash("sha256").update(doc.doc).digest("hex");
+				return oldHashes[doc.branch] !== hash;
+			});
+			if (changed.length === 0) return notify(ctx, "pi-handoff project: all branch handoffs already scanned");
+			let candidates = store.readProjectCandidates();
+			const currentKnowledge = [
+				...store.readProjectKnowledge().split("\n").filter((line) => line.startsWith("- ")),
+			];
+			const protectedPins = store.pinnedNotes();
+			const considered = new Set(candidates.map((c) => c.statement));
 			let added = 0;
-			let deduped = 0;
-			for (let i = 0; i < res.candidates.length; i++) {
-				const c = res.candidates[i];
-				const yes = await ctx.ui.confirm(
-					`pi-handoff distill — candidate ${i + 1} of ${res.candidates.length}`,
-					`${c}\n\nPin this as a standing rule? It will apply on every branch and is never rewritten by the summarizer.`,
-				);
-				if (!yes) continue;
-				if (store.appendPinned(c)) {
-					store.appendEvent({ sessionId: store.meta.sessionId, turn: -1, type: "pin", note: c });
+			let invalidated = 0;
+			let modelSource = "unknown model";
+			for (let offset = 0; offset < changed.length; offset += PROJECT_SCAN_BRANCHES_PER_BATCH) {
+				const batch = changed.slice(offset, offset + PROJECT_SCAN_BRANCHES_PER_BATCH);
+				const res = await runProjectExtraction(batch, currentKnowledge, [...considered], protectedPins, modelCtx(ctx), REFRESH_TIMEOUT_MS);
+				modelSource = res.modelSource;
+				const byId = new Map(candidates.map((c) => [c.id, c]));
+				for (const c of res.candidates) {
+					if (c.action === "invalidate") {
+						const target = c.target?.toLowerCase();
+						const prior = candidates.find((candidate) => candidate.status === "suggested" && candidate.statement.toLowerCase() === target);
+						if (prior) {
+							prior.status = "rejected";
+							byId.set(prior.id, prior);
+							invalidated++;
+						}
+						continue;
+					}
+					const id = createHash("sha256")
+						.update(`${c.action}\0${c.target ?? ""}\0${c.statement}`.trim().toLowerCase())
+						.digest("hex")
+						.slice(0, 16);
+					if (byId.has(id)) continue;
+					byId.set(id, { ...c, action: c.action as ProjectCandidate["action"], id, createdAt: new Date().toISOString(), status: "suggested" });
+					considered.add(c.statement);
 					added++;
-				} else {
-					deduped++;
 				}
+				candidates = [...byId.values()];
+				store.saveProjectCandidates(candidates);
+				// Commit progress only after both extraction and candidate persistence
+				// succeeded. A later batch failure leaves its branches retryable.
+				for (const doc of batch) nextHashes[doc.branch] = createHash("sha256").update(doc.doc).digest("hex");
+				store.saveProjectScanHashes(nextHashes);
 			}
-			notify(
-				ctx,
-				`pi-handoff: distill done — ${added} pinned, ${deduped} already pinned, ${res.candidates.length - added - deduped} skipped (${docs.length} branch handoffs scanned via ${res.modelSource})`,
-			);
+			const archived = storedDocs.length - allDocs.length;
+			notify(ctx, `pi-handoff project: scanned ${changed.length} changed handoff(s) in ${Math.ceil(changed.length / PROJECT_SCAN_BRANCHES_PER_BATCH)} batch(es) via ${modelSource}; ${added} new suggestion(s)${invalidated ? `, ${invalidated} conflicting unreviewed suggestion(s) withdrawn` : ""}${archived ? `; ${archived} archived/deleted branch store(s) skipped` : ""}`);
 		});
+	}
+
+	async function cmdProjectReview(ctx: ExtensionCommandContext): Promise<void> {
+		if (!store) return;
+		const candidates = store.readProjectCandidates();
+		const pending = candidates.filter((c) => c.status === "suggested");
+		if (pending.length === 0) return notify(ctx, "pi-handoff project: no suggestions awaiting review");
+		if (!ctx.hasUI) return notify(ctx, pending.map((c) => `[${c.action ?? "add"}/${c.section}] ${c.target ? `${c.target} → ` : ""}${c.statement}\n  evidence: ${c.evidence}`).join("\n"));
+		let approved = 0;
+		let added = 0;
+		let failed = 0;
+		const failureReasons: string[] = [];
+		for (let i = 0; i < pending.length; i++) {
+			const candidate = pending[i];
+			const action = candidate.action ?? "add";
+			const change = action === "add"
+				? `Add under ${candidate.section}:\n${candidate.statement}`
+				: action === "replace"
+					? `Replace:\n- ${candidate.target}\n+ ${candidate.statement}`
+					: `Remove:\n- ${candidate.target ?? candidate.statement}`;
+			const yes = await ctx.ui.confirm(
+				`pi-handoff project — suggestion ${i + 1} of ${pending.length}`,
+				`${change}\n\nEvidence: ${candidate.evidence || "derived from branch handoff"}\nBranches: ${candidate.branches.join(", ") || "unspecified"}\n\nApply this change to shared project.md?`,
+			);
+			if (yes) {
+				approved++;
+				const result = store.applyProjectCandidate(candidate);
+				candidate.status = result.applied ? "accepted" : "rejected";
+				if (result.applied) added++;
+				else {
+					failed++;
+					failureReasons.push(`${candidate.statement}: ${result.reason ?? "unknown reason"}`);
+				}
+			} else candidate.status = "rejected";
+		}
+		store.saveProjectCandidates(candidates);
+		status(ctx);
+		notify(ctx, `pi-handoff project review: ${added} applied, ${pending.length - approved} rejected${failed ? `, ${failed} could not be applied\n${failureReasons.join("\n")}` : ""}`);
+	}
+
+	function parseProjectFact(text: string): { section: ProjectSection; statement: string } {
+		for (const section of PROJECT_SECTIONS) {
+			const prefix = `${section}:`;
+			if (text.toLowerCase().startsWith(prefix.toLowerCase())) return { section, statement: text.slice(prefix.length).trim() };
+		}
+		return { section: "Conventions", statement: text };
+	}
+
+	function cmdProjectAdd(ctx: Ctx, text: string): void {
+		if (!store || !text) return notify(ctx, "usage: /pi-handoff project add [Section:] <fact>", "warning");
+		const { section, statement } = parseProjectFact(text);
+		if (!statement) return notify(ctx, "pi-handoff project: fact is empty", "warning");
+		if (store.appendProjectKnowledge(section, statement)) return notify(ctx, `pi-handoff project: added under ${section}`);
+		if (store.readProjectKnowledge().length >= PROJECT_KNOWLEDGE_CAP_CHARS)
+			return notify(ctx, "pi-handoff project: knowledge is at its 16k limit — replace or forget stale facts first", "warning");
+		notify(ctx, "pi-handoff project: already present — no change");
+	}
+
+	function cmdProjectForget(ctx: Ctx, text: string): void {
+		if (!store || !text) return notify(ctx, "usage: /pi-handoff project forget <substring>", "warning");
+		const { removed, candidates } = store.removeProjectKnowledge(text);
+		if (removed) return notify(ctx, `pi-handoff project: removed ${removed}`);
+		if (candidates.length > 1) return notify(ctx, `pi-handoff project: ambiguous match — nothing removed:\n${candidates.join("\n")}`, "warning");
+		notify(ctx, `pi-handoff project: no knowledge matches "${text}"`, "warning");
 	}
 
 	async function cmdReset(ctx: ExtensionCommandContext): Promise<void> {
@@ -790,6 +962,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	function cmdToggle(ctx: Ctx, enabled: boolean): void {
 		if (!store) return;
+		if (!enabled && activeAbort) activeAbort.abort(new Error("pi-handoff: disabled"));
 		store.meta.enabled = enabled;
 		store.saveMetaSync();
 		status(ctx);

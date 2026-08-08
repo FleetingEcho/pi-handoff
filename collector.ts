@@ -13,6 +13,10 @@ const USER_EXCERPT_MAX = 2_000;
 const ASSISTANT_EXCERPT_MAX = 2_000;
 const TOOL_EXCERPT_MAX = 500;
 const TOOL_ARGS_DIGEST_MAX = 160;
+/** A single turn may contain hundreds of tool results. Bound the durable event
+ * itself so one pathological turn never relies on prompt-level head/tail loss. */
+const TURN_EXCERPTS_MAX = 12_000;
+const CHANGED_FILES_MAX = 200;
 
 type Excerpt = NonNullable<HandoffEvent["excerpts"]>[number];
 
@@ -112,14 +116,32 @@ export class Collector {
 			});
 		}
 
-		const changedFiles = [...this.turnChangedFiles];
+		let keptChars = 0;
+		const bounded: Excerpt[] = [];
+		for (const excerpt of excerpts) {
+			const remaining = TURN_EXCERPTS_MAX - keptChars;
+			if (remaining <= 0) break;
+			const marker = "… [turn excerpt capped]";
+			const text = excerpt.text.length <= remaining
+				? excerpt.text
+				: remaining > marker.length
+					? excerpt.text.slice(0, remaining - marker.length) + marker
+					: excerpt.text.slice(0, remaining);
+			bounded.push({ ...excerpt, text });
+			keptChars += text.length;
+		}
+		if (bounded.length < excerpts.length) {
+			bounded.push({ role: "tool", toolName: "pi-handoff", text: `[${excerpts.length - bounded.length} additional excerpts omitted from this turn]` });
+		}
+
+		const changedFiles = [...this.turnChangedFiles].slice(0, CHANGED_FILES_MAX);
 		this.turnChangedFiles.clear();
 
 		return this.store.appendEvent({
 			sessionId: this.store.meta.sessionId,
 			turn: event.turnIndex,
 			type: "turn_end",
-			excerpts,
+			excerpts: bounded,
 			changedFiles,
 		});
 	}

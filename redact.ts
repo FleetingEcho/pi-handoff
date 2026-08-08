@@ -30,6 +30,7 @@ const PATTERNS: Array<[RegExp, string]> = [
 	// JWTs
 	[/\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/g, "[REDACTED-JWT]"],
 	// Generic assignments-ish: KEY/SECRET/TOKEN/PASSWORD values in env/config style
+	[/(\b(?:KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY)\b\s*[=:]\s*["']?)[^\s"',]{8,}/gi, "$1[REDACTED]"],
 	[/(\b[A-Z][A-Z0-9_]*(?:API_KEY|SECRET|TOKEN|PASSWORD|PASSWD|PRIVATE_KEY)[A-Z0-9_]*\b\s*[=:]\s*["']?)[^\s"',]{8,}/g, "$1[REDACTED]"],
 	[/(\b(?:api[_-]?key|secret|password|passwd|access[_-]?token)\b\s*[=:]\s*["']?)[^\s"',]{8,}/gi, "$1[REDACTED]"],
 ];

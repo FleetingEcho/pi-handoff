@@ -8,7 +8,15 @@ import { uuidv7 } from "@earendil-works/pi-ai";
 import { complete } from "@earendil-works/pi-ai/compat";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { redact } from "./redact";
-import { HANDOFF_CAP_CHARS, HANDOFF_SECTIONS, NEW_EVENTS_CAP_CHARS, HandoffStore, type HandoffEvent } from "./store";
+import {
+	HANDOFF_CAP_CHARS,
+	HANDOFF_SECTIONS,
+	NEW_EVENTS_CAP_CHARS,
+	PROJECT_SECTIONS,
+	HandoffStore,
+	type HandoffEvent,
+	type ProjectSection,
+} from "./store";
 
 type ModelCtx = Pick<ExtensionContext, "model" | "modelRegistry">;
 
@@ -110,7 +118,29 @@ function extractDocument(text: string): string {
 }
 
 function hasAllSections(doc: string): boolean {
-	return HANDOFF_SECTIONS.every((s) => new RegExp(`^# ${s}\\s*$`, "m").test(doc));
+	const headings = [...doc.matchAll(/^# ([^\n]+?)\s*$/gm)].map((m) => m[1]);
+	if (headings.length !== HANDOFF_SECTIONS.length) return false;
+	if (!HANDOFF_SECTIONS.every((section, i) => headings[i] === section)) return false;
+	// The first non-whitespace content must be the first required heading.
+	return doc.trimStart().startsWith(`# ${HANDOFF_SECTIONS[0]}\n`) || doc.trim() === `# ${HANDOFF_SECTIONS[0]}`;
+}
+
+/** Keep every required section even when a model ignores the character cap. */
+function fitDocument(doc: string): string {
+	if (doc.length <= HANDOFF_CAP_CHARS) return doc;
+	const sections = HANDOFF_SECTIONS.map((section, i) => {
+		const start = doc.indexOf(`# ${section}`) + section.length + 2;
+		const next = i + 1 < HANDOFF_SECTIONS.length ? doc.indexOf(`# ${HANDOFF_SECTIONS[i + 1]}`, start) : doc.length;
+		return doc.slice(start, next).trim();
+	});
+	const headingsCost = HANDOFF_SECTIONS.reduce((n, section) => n + section.length + 5, 0);
+	const marker = "\n\n[...section truncated by pi-handoff]";
+	const perSection = Math.max(0, Math.floor((HANDOFF_CAP_CHARS - headingsCost) / HANDOFF_SECTIONS.length));
+	return HANDOFF_SECTIONS.map((section, i) => {
+		const body = sections[i];
+		const fitted = body.length <= perSection ? body : body.slice(0, Math.max(0, perSection - marker.length)).trimEnd() + marker;
+		return `# ${section}\n${fitted}`.trimEnd();
+	}).join("\n\n") + "\n";
 }
 
 // ---------------------------------------------------------------------------
@@ -134,7 +164,7 @@ Rules:
 - Wrap the final document in <document></document> tags. No commentary outside the tags.`;
 }
 
-function serializeEvents(events: HandoffEvent[]): string {
+function serializeEvents(events: HandoffEvent[], cap = true): string {
 	const lines: string[] = [];
 	for (const ev of events) {
 		if (ev.type === "pin") {
@@ -153,7 +183,7 @@ function serializeEvents(events: HandoffEvent[]): string {
 		if (ev.changedFiles?.length) lines.push(`CHANGED FILES: ${ev.changedFiles.join(", ")}`);
 	}
 	let text = lines.join("\n\n");
-	if (text.length > NEW_EVENTS_CAP_CHARS) {
+	if (cap && text.length > NEW_EVENTS_CAP_CHARS) {
 		const head = Math.floor(NEW_EVENTS_CAP_CHARS * 0.3);
 		const tail = NEW_EVENTS_CAP_CHARS - head;
 		text =
@@ -164,20 +194,40 @@ function serializeEvents(events: HandoffEvent[]): string {
 	return text;
 }
 
+/** Select an oldest-first, whole-event batch that fits one model call. */
+function refreshBatch(events: HandoffEvent[]): HandoffEvent[] {
+	const batch: HandoffEvent[] = [];
+	let chars = 0;
+	for (const event of events) {
+		const eventChars = serializeEvents([event], false).length + (batch.length ? 2 : 0);
+		if (batch.length > 0 && chars + eventChars > NEW_EVENTS_CAP_CHARS) break;
+		batch.push(event); // always make progress, even if one pathological event exceeds the cap
+		chars += eventChars;
+	}
+	return batch;
+}
+
 export interface OpOutcome {
 	skipped?: boolean;
 	modelSource?: string;
 	chars?: number;
+	remaining?: boolean;
 }
 
 export async function runRefresh(store: HandoffStore, ctx: ModelCtx, timeoutMs: number, abortSignal?: AbortSignal): Promise<OpOutcome> {
-	const events = store.readEventsSince(store.meta.lastRefreshedSeq).filter((e) => e.type === "turn_end" || e.type === "pin");
-	if (events.length === 0) return { skipped: true };
+	const pendingEvents = store.readEventsSince(store.meta.lastRefreshedSeq).filter((e) => e.type === "turn_end" || e.type === "pin");
+	if (pendingEvents.length === 0) return { skipped: true };
+	const events = refreshBatch(pendingEvents);
 
-	const { body } = store.splitPinned(redact(store.readHandoff()));
+	const sourceDocument = store.readHandoff();
+	const { body } = store.splitPinned(redact(sourceDocument));
+	const projectKnowledge = store.readProjectKnowledge();
 	const pins = store.pinnedNotes();
+	const projectBlock = HandoffStore.hasRealContent(projectKnowledge)
+		? `<project_knowledge note="durable project-wide context — read-only; do not copy it into branch task state">\n${redact(projectKnowledge)}\n</project_knowledge>\n\n`
+		: "";
 	const pinBlock = pins.length ? `<pinned_notes note="standing project rules — read-only, do not restate or contradict">\n${redact(pins.join("\n"))}\n</pinned_notes>\n\n` : "";
-	const userText = `${pinBlock}<current_document path="${store.handoffPath}">
+	const userText = `${projectBlock}${pinBlock}<current_document path="${store.handoffPath}">
 ${body.trim() || "(empty — first refresh)"}
 </current_document>
 
@@ -215,92 +265,130 @@ Merge the new events into the handoff document.`;
 		if (hasAllSections(shrunk)) doc = shrunk;
 	}
 
-	// Final backstop: hard-truncate the tail with a marker (injection also backstops).
-	if (doc.length > HANDOFF_CAP_CHARS * 1.25) {
-		doc = doc.slice(0, HANDOFF_CAP_CHARS) + `\n\n[...truncated by pi-handoff — earlier versions are in events.jsonl]`;
-	}
 
-	store.writeHandoff(redact(doc), { snapshot: true });
+	// Final backstop is section-aware: a raw tail slice can remove Active Files
+	// and Next Steps and leave the persisted document outside its own contract.
+	doc = fitDocument(doc);
+
+	// Do not overwrite a manual edit (or another session's refresh) made while
+	// this model call was in flight. Events remain pending and will be merged
+	// against the newer document on the next attempt.
+	store.writeHandoff(redact(doc), { snapshot: true, expectedCurrent: sourceDocument });
 	store.markRefreshed(events[events.length - 1].seq);
 	store.recordUsage(totalUsage);
 	store.saveMetaSync();
 	if (DEBUG()) console.error(`[pi-handoff] refresh via ${res.modelSource}, ${doc.length} chars, ${events.length} events`);
-	return { modelSource: res.modelSource, chars: doc.length };
+	return { modelSource: res.modelSource, chars: doc.length, remaining: pendingEvents.length > events.length };
 }
 
 // ---------------------------------------------------------------------------
-// Distill (every branch's handoff -> candidate pins)
+// Project extraction (branch handoffs -> reviewed project-knowledge candidates)
 // ---------------------------------------------------------------------------
 
-/** Per-doc and total caps for one distill call. */
-const DISTILL_DOC_CAP_CHARS = 8_000;
-const DISTILL_TOTAL_CAP_CHARS = 48_000;
-const DISTILL_MAX_CANDIDATES = 12;
+/** Per-document and total input caps for one project extraction call. */
+const PROJECT_EXTRACT_DOC_CAP_CHARS = 8_000;
+const PROJECT_EXTRACT_TOTAL_CAP_CHARS = 48_000;
+const PROJECT_EXTRACT_MAX_CANDIDATES = 12;
 
-function distillSystemPrompt(): string {
-	return `You are extracting STANDING PROJECT FACTS from the handoff documents of several git branches of the same project, to propose them as pinned rules for the whole project.
+function projectExtractionSystemPrompt(): string {
+	return `You are extracting DURABLE PROJECT KNOWLEDGE from handoff documents of one or more git branches.
 
-A standing fact is true on EVERY branch and stays true after the current tasks end. Good candidates: the actual command to build/test/run this project when it is not obvious; where a shared component or config lives; deploy/release rules; hard prohibitions ("never edit src/generated/"); conventions the repo does not enforce itself; a stated user preference about how to work here.
+	A candidate does not need to be mentioned by every branch. It qualifies when it describes how the PROJECT works and there is no evidence that it is temporary, task-specific, or limited to one branch. Good candidates: architecture, stable conventions, build/test/release workflows, decisions with reusable rationale, and recurring pitfalls.
 
-Reject everything else: task state, goals, progress, next steps, open questions, file lists; anything specific to one branch or one task; one-off decisions; anything already covered by AGENTS.md/README or by the already-pinned notes; secrets.
+	Reject task state, goals, progress, next steps, open questions, temporary file lists, one-off implementation details, secrets, and anything already represented in the current project knowledge or pinned rules. If branches contradict each other, do not pick a winner; omit that fact.
 
-Output contract:
-- ONLY bullet lines, each starting with "- ", one fact per line, at most 200 characters each.
-- At most ${DISTILL_MAX_CANDIDATES} bullets. Merge near-duplicates into one. If nothing qualifies, output nothing.
-- No headers, no numbering, no commentary. When in doubt, leave it out — a pin is repeated to every future session of this project.`;
+	Output contract:
+	- Output ONLY a JSON array, with at most ${PROJECT_EXTRACT_MAX_CANDIDATES} objects. Output [] when nothing qualifies.
+	- Each object has exactly: "action", "section", "statement", "target", "evidence", "branches".
+	- "action" is "add", "replace", "remove", or "invalidate". Use replace/remove when current project knowledge is stale and the branch evidence is strong; otherwise do not propose destructive changes. Use invalidate only when branch evidence contradicts an item in already_considered; it withdraws an unreviewed proposal, never project.md content.
+	- "section" must be one of: ${PROJECT_SECTIONS.join(", ")}.
+	- "statement" is one durable fact, at most 240 characters.
+	- For replace/remove, "target" must exactly copy a current_project_knowledge bullet without its "- " prefix. For invalidate, target must exactly copy an already_considered statement. For add, target is an empty string.
+	- Protected pins are context only: never replace, remove, invalidate, restate, or contradict them.
+	- "evidence" briefly says why it appears project-wide rather than task-specific, at most 240 characters.
+	- "branches" is an array of branch names that supplied evidence. Merge near-duplicates.`;
 }
 
-export interface DistillResult {
-	candidates: string[];
+export interface ProjectExtractionResult {
+	candidates: Array<{
+		action: "add" | "replace" | "remove" | "invalidate";
+		section: ProjectSection;
+		statement: string;
+		target?: string;
+		evidence: string;
+		branches: string[];
+	}>;
 	modelSource: string;
 }
 
 /**
  * Cross-branch extraction, the one aggregation a per-branch refresh cannot do.
- * Returns candidate standing facts ONLY — the caller presents them for user
- * review and appends confirmed ones via appendPinned. Nothing here writes.
+ * Returns durable project-knowledge candidates only. The caller persists them
+ * to a review queue; this function never writes project.md itself.
  */
-export async function runDistill(
+export async function runProjectExtraction(
 	docs: Array<{ branch: string; doc: string }>,
-	existingPins: string[],
+	currentKnowledge: string[],
+	alreadyConsidered: string[],
+	protectedPins: string[],
 	ctx: ModelCtx,
 	timeoutMs: number,
 	abortSignal?: AbortSignal,
-): Promise<DistillResult> {
+): Promise<ProjectExtractionResult> {
 	let blob = docs
 		.map((d) =>
-			d.doc.length > DISTILL_DOC_CAP_CHARS
-				? `=== branch: ${d.branch} ===\n${d.doc.slice(0, DISTILL_DOC_CAP_CHARS)}\n[...doc truncated...]`
+			d.doc.length > PROJECT_EXTRACT_DOC_CAP_CHARS
+				? `=== branch: ${d.branch} ===\n${d.doc.slice(0, PROJECT_EXTRACT_DOC_CAP_CHARS)}\n[...doc truncated...]`
 				: `=== branch: ${d.branch} ===\n${d.doc}`,
 		)
 		.join("\n\n");
-	if (blob.length > DISTILL_TOTAL_CAP_CHARS) {
-		const head = Math.floor(DISTILL_TOTAL_CAP_CHARS * 0.3);
-		blob = blob.slice(0, head) + "\n\n[...branches elided...]\n\n" + blob.slice(blob.length - (DISTILL_TOTAL_CAP_CHARS - head));
+	if (blob.length > PROJECT_EXTRACT_TOTAL_CAP_CHARS) {
+		const head = Math.floor(PROJECT_EXTRACT_TOTAL_CAP_CHARS * 0.3);
+		blob = blob.slice(0, head) + "\n\n[...branches elided...]\n\n" + blob.slice(blob.length - (PROJECT_EXTRACT_TOTAL_CAP_CHARS - head));
 	}
-	const pinBlock = existingPins.length ? `<already_pinned>\n${existingPins.join("\n")}\n</already_pinned>\n\n` : "";
+	const existingBlock = currentKnowledge.length ? `<current_project_knowledge note="replace/remove targets must come only from this block">\n${currentKnowledge.join("\n")}\n</current_project_knowledge>\n\n` : "";
+	const consideredBlock = alreadyConsidered.length ? `<already_considered note="do not propose these again; they are not necessarily accepted knowledge">\n${alreadyConsidered.join("\n")}\n</already_considered>\n\n` : "";
+	const pinsBlock = protectedPins.length ? `<protected_pins note="read-only hard rules">\n${protectedPins.join("\n")}\n</protected_pins>\n\n` : "";
 	const res = await callLlm(
 		ctx,
-		distillSystemPrompt(),
-		`${pinBlock}<branch_handoffs>\n${redact(blob)}\n</branch_handoffs>\n\nExtract the standing project facts as candidate pins.`,
+		projectExtractionSystemPrompt(),
+		`${existingBlock}${consideredBlock}${pinsBlock}<branch_handoffs>\n${redact(blob)}\n</branch_handoffs>\n\nExtract durable project knowledge candidates.`,
 		timeoutMs,
 		abortSignal,
 	);
 
 	const norm = (s: string) => s.replace(/^-\s*/, "").trim().toLowerCase();
-	const seen = new Set(existingPins.map(norm));
-	const candidates: string[] = [];
-	for (const line of res.text.split("\n")) {
-		const t = line.trim();
-		if (!t.startsWith("- ")) continue;
-		const item = redact(t.slice(2).replace(/\s+/g, " ").trim()).slice(0, 200).trim();
-		if (!item || item.length < 12) continue; // strays like "- none" carry no information
-		const n = norm(item);
-		if (seen.has(n)) continue;
-		seen.add(n);
-		candidates.push(item);
-		if (candidates.length >= DISTILL_MAX_CANDIDATES) break;
+	const seen = new Set([...currentKnowledge, ...alreadyConsidered, ...protectedPins].map(norm));
+	const candidates: ProjectExtractionResult["candidates"] = [];
+	try {
+		const json = res.text.match(/\[[\s\S]*\]/)?.[0] ?? "[]";
+		const parsed = JSON.parse(json) as unknown;
+		if (Array.isArray(parsed)) {
+			for (const raw of parsed) {
+				if (!raw || typeof raw !== "object") continue;
+				const item = raw as Record<string, unknown>;
+				if (!PROJECT_SECTIONS.includes(item.section as ProjectSection)) continue;
+				const action = item.action === "replace" || item.action === "remove" || item.action === "invalidate" ? item.action : "add";
+				const statement = redact(String(item.statement ?? "").replace(/\s+/g, " ").trim()).slice(0, 240).trim();
+				const target = redact(String(item.target ?? "").replace(/^-\s*/, "").replace(/\s+/g, " ").trim()).slice(0, 240).trim();
+				if (action !== "remove" && action !== "invalidate" && statement.length < 12) continue;
+				if (action !== "add" && target.length < 12) continue;
+				if (action === "add" && seen.has(norm(statement))) continue;
+				seen.add(norm(statement));
+				candidates.push({
+					action,
+					section: item.section as ProjectSection,
+					statement: action === "remove" || action === "invalidate" ? target : statement,
+					target: action === "add" ? undefined : target,
+					evidence: redact(String(item.evidence ?? "").replace(/\s+/g, " ").trim()).slice(0, 240),
+					branches: Array.isArray(item.branches) ? item.branches.filter((b): b is string => typeof b === "string").slice(0, 12) : [],
+				});
+				if (candidates.length >= PROJECT_EXTRACT_MAX_CANDIDATES) break;
+			}
+		}
+	} catch {
+		// Invalid structured output is equivalent to no safe candidates.
 	}
-	if (DEBUG()) console.error(`[pi-handoff] distill via ${res.modelSource}: ${candidates.length} candidates from ${docs.length} branch docs`);
+	if (DEBUG()) console.error(`[pi-handoff] project extraction via ${res.modelSource}: ${candidates.length} candidates from ${docs.length} branch docs`);
 	return { candidates, modelSource: res.modelSource };
 }
