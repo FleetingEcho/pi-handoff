@@ -1,13 +1,33 @@
 {
-  "name": "pi-handoff",
+  "name": "@fleetingecho/pi-handoff",
   "version": "0.10.0",
   "type": "module",
-  "description": "Self-maintaining handoff.md per working directory + git branch for pi, stored under ~/.agent/agent-handoff.",
+  "description": "Automatic per-branch handoffs and reviewed project-wide memory for Pi.",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/FleetingEcho/pi-handoff.git"
+  },
+  "homepage": "https://github.com/FleetingEcho/pi-handoff#readme",
+  "bugs": {
+    "url": "https://github.com/FleetingEcho/pi-handoff/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "*.ts",
+    "skills",
+    "README.md",
+    "DESIGN.md"
+  ],
   "keywords": [
     "pi-package",
+    "pi-extension",
     "pi",
-    "handoff"
+    "handoff",
+    "memory",
+    "coding-agent"
   ],
   "pi": {
     "extensions": [
@@ -31,9 +51,14 @@
     }
   },
   "scripts": {
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck",
+    "pack:check": "npm pack --dry-run",
+    "prepublishOnly": "npm run check"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
     "@types/node": "^24.0.0",
     "typebox": "^1.3.0",
     "typescript": "^5.9.0"

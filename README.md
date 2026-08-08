@@ -9,14 +9,20 @@ The extension records recent turns, periodically folds them into concise Markdow
 Requires pi ≥ 0.83.
 
 ```bash
-pi install git:github.com/FleetingEcho/pi-handoff
+pi install npm:@fleetingecho/pi-handoff
 ```
 
 Restart pi after installing or updating, then run `/pi-handoff` to verify that it loaded.
 
 ```bash
-pi update --extensions  # update an unpinned git install
-pi remove git:github.com/FleetingEcho/pi-handoff
+pi update npm:@fleetingecho/pi-handoff
+pi remove npm:@fleetingecho/pi-handoff
+```
+
+You can also install the latest source directly from GitHub:
+
+```bash
+pi install git:github.com/FleetingEcho/pi-handoff
 ```
 
 ## How memory is organized
