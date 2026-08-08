@@ -1,6 +1,6 @@
 {
   "name": "@fleetingecho/pi-handoff",
-  "version": "0.10.0",
+  "version": "1.7.0",
   "type": "module",
   "description": "Automatic per-branch handoffs and reviewed project-wide memory for Pi.",
   "license": "MIT",
