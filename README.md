@@ -19,6 +19,7 @@ pi update --extensions  # update an unpinned git install
 pi remove git:github.com/FleetingEcho/pi-handoff
 ```
 
+
 ## How memory is organized
 
 pi-handoff keeps three kinds of memory with different lifetimes:
@@ -39,9 +40,17 @@ Normally, just work. A background refresh runs roughly every three turns, sooner
 /pi-handoff status       # paths, pending events, usage, and project suggestions
 /pi-handoff flush        # update the current branch handoff immediately
 /pi-handoff clear        # start a fresh branch handoff for a new task
-/pi-handoff off          # disable collection, refresh, and injection
-/pi-handoff on
+/pi-handoff pause        # stop recording this session; the gap is never written
+/pi-handoff resume       # start recording again
 ```
+
+### Pausing
+
+`/pi-handoff pause` stops the extension from recording the conversation: no turns are collected and no refresh runs, so the paused stretch leaves nothing behind — there is no gap content to filter out afterwards. Work buffered *before* the pause is kept and folds into `handoff.md` after `/pi-handoff resume`.
+
+Injection keeps working while paused, so the agent still reads the existing `handoff.md` and `project.md`. Pins, `project add`, and an explicit `/pi-handoff flush` also still work — pausing suppresses automatic recording, not deliberate commands.
+
+A pause lasts only for the current session. Starting a new session (or restarting pi) always resumes recording, so a pause can never silently mute a branch forever.
 
 On the next session, start with “keep going” or “what’s left?”; the previous branch handoff is already in context.
 
@@ -56,7 +65,7 @@ The status bar shows the active model, synchronization state, branch, and pendin
 - Model name: the active model used by the session.
 - `✓ Synced`: no handoff refresh is currently running.
 - `↻ Syncing`: the branch handoff is being refreshed.
-- `○ off`: the extension is disabled.
+- `⏸ Paused`: recording is paused for this session; the agent still reads the documents.
 - `branch:<name>`: the active handoff branch; non-git directories use `default`.
 - `· N project`: N project-knowledge suggestions are awaiting review; hidden when zero.
 
@@ -117,9 +126,9 @@ Do not pin current task progress, branch-specific state, duplicated documentatio
 | `/pi-handoff project forget <substring>` | Remove one shared fact; ambiguous matches remove nothing |
 | `/pi-handoff pin <rule>` | Add a protected project-wide rule |
 | `/pi-handoff unpin <substring>` | Remove one pin; ambiguous matches remove nothing |
-| `/pi-handoff on` / `off` | Enable or disable the extension for this session |
+| `/pi-handoff pause` / `resume` | Stop and restart recording for this session; injection stays active |
 
-The agent tool supports `status`, `flush`, `project_propose`, `pin`, and `unpin`. Destructive controls such as `clear` and `off` remain user-only.
+The agent tool supports `status`, `flush`, `project_propose`, `pin`, and `unpin`. Destructive controls such as `clear`, and `pause`/`resume`, remain user-only — while paused the tool's `flush` reports the pause instead of writing.
 
 ## Storage
 
@@ -136,9 +145,11 @@ All files live outside the project:
     └── meta.json              cursors and session metadata
 ```
 
-The project key uses the git repository root, so launching pi from different subdirectories reaches the same store. Symlinked paths are resolved, sanitized-name collisions are disambiguated, and older layouts migrate automatically. Set `PI_HANDOFF_DIR` to use another storage root.
+The project key uses the git repository root, so launching pi from different subdirectories reaches the same store. The root is found by walking up from the working directory to the nearest `.git` (a directory, or the file used by worktrees and submodules); `git rev-parse` is only a fallback, so detection still works when git is absent or refuses the directory as dubiously owned. Outside a repository the working directory itself is the key. Symlinked paths are resolved, sanitized-name collisions are disambiguated, and older layouts migrate automatically. Set `PI_HANDOFF_DIR` to use another storage root.
 
-The branch document contains seven fixed sections: Current Goal, Progress, Decisions, Constraints, Open Questions, Active Files, and Next Steps. It is capped at roughly 24,000 characters while preserving all section headings.
+If older stores keyed to a subdirectory of the current repo are still on disk — from launches predating repo-root keying, or from a period when git detection was failing — pi-handoff names them once at session start. Nothing is moved or deleted automatically: copy anything worth keeping across with `/pi-handoff project add`, then remove those directories yourself.
+
+The branch document contains seven fixed sections: Current Goal, Progress, Decisions, Constraints, Open Questions, Active Files, and Next Steps. It is capped at roughly 16,000 characters while preserving all section headings.
 
 Shared project knowledge is capped at roughly 16,000 characters because it is injected on every request. When it approaches the limit, replace or remove stale facts before adding more; protected pins use a separate section.
 

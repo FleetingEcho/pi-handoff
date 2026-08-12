@@ -59,8 +59,21 @@ export type ProjectSection = (typeof PROJECT_SECTIONS)[number];
  * branch handoff. Pins are protected separately and do not count toward it. */
 export const PROJECT_KNOWLEDGE_CAP_CHARS = 16_000;
 
-/** Rough char budget (~6000 tokens @ ~4 chars/token). */
-export const HANDOFF_CAP_CHARS = 24_000;
+/**
+ * Rough char budget (~4000 tokens @ ~4 chars/token).
+ *
+ * This one number sets three costs at once: the fold's OUTPUT (the document is
+ * rewritten whole every time, and output bills several times higher than
+ * input), the fold's input, and the per-session injection. Lowering it is the
+ * only lever that cuts output tokens without changing the model.
+ *
+ * 16k rather than tighter: exceeding the cap triggers a second "compress" model
+ * call in runRefresh(), so a cap set near the size documents actually reach
+ * would COST more, not less. Measured across a live store, the largest handoff
+ * was ~11.4k chars, so this leaves real headroom while cutting the worst case
+ * by a third.
+ */
+export const HANDOFF_CAP_CHARS = 16_000;
 /** Cap on the serialized new-events payload fed to one refresh call. */
 export const NEW_EVENTS_CAP_CHARS = 30_000;
 
@@ -247,6 +260,32 @@ export function migrateProjectKey(cwd: string, projectRoot: string): boolean {
 	}
 }
 
+/**
+ * Containers keyed to a SUBDIRECTORY of `projectRoot` — stores minted before
+ * repo-root keying (or while git detection was failing) by launching the agent
+ * from inside the repo. migrateProjectKey can only carry one of them forward,
+ * and never over an existing repo-root container, so the rest sit there holding
+ * real handoffs nobody reads. Reporting them lets the user decide; nothing is
+ * moved or deleted automatically.
+ */
+export function orphanSubdirStores(projectRoot: string): string[] {
+	const root = resolve(projectRoot);
+	const selfContainer = projectKey(root).container;
+	const out: string[] = [];
+	try {
+		for (const ent of readdirSync(storeHome(), { withFileTypes: true })) {
+			if (!ent.isDirectory()) continue;
+			const container = join(storeHome(), ent.name);
+			if (container === selfContainer) continue;
+			const owner = readContainerProjectPath(container);
+			if (owner && owner.startsWith(`${root}/`)) out.push(owner);
+		}
+	} catch {
+		// no store home yet — the first-run case
+	}
+	return out.sort();
+}
+
 /** Absolute path + container dir + slug for a working directory. */
 export function projectKey(cwd: string): { abs: string; cwdSlug: string; container: string } {
 	let abs = resolve(cwd);
@@ -378,7 +417,6 @@ export interface Meta {
 	lastRefreshedSeq: number;
 	eventLineCount: number;
 	summarizerUsage: { calls: number; totalTokens: number };
-	enabled: boolean;
 	updatedAt: string;
 }
 
@@ -397,7 +435,6 @@ function defaultMeta(): Meta {
 		lastRefreshedSeq: 0,
 		eventLineCount: 0,
 		summarizerUsage: { calls: 0, totalTokens: 0 },
-		enabled: true,
 		updatedAt: now,
 	};
 }
@@ -426,7 +463,9 @@ function normalizeMeta(value: unknown): Meta {
 			calls: finiteInt(usage.calls, 0),
 			totalTokens: finiteInt(usage.totalTokens, 0),
 		},
-		enabled: typeof raw.enabled === "boolean" ? raw.enabled : true,
+		// A pre-v0.11.0 `enabled: false` (from the removed durable /pi-handoff off)
+		// is deliberately dropped: pausing is now session-scoped, so no store can
+		// stay silently muted across sessions with no command left to revive it.
 		updatedAt: text(raw.updatedAt, base.updatedAt, 64),
 	};
 }

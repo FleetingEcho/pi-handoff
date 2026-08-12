@@ -22,20 +22,25 @@
  * The agent curates the shared project.md itself through the `handoff` tool
  * (status|flush|pin|unpin) — the same write surface opencode-handoff exposes,
  * so a standing rule noticed by either agent is visible to both. Task clears
- * and on/off stay user-only (slash commands); the agent may curate memory but
- * never wipe it.
+ * and pause/resume stay user-only (slash commands); the agent may curate
+ * memory but never wipe it.
  *
- * Commands: /pi-handoff status|flush|project|pin|unpin|clear|on|off
+ * Pausing is session-scoped and in-memory: while paused nothing is collected,
+ * so the paused stretch leaves no trace to filter out later, while injection
+ * keeps working so the agent still READS the existing documents. Work buffered
+ * before the pause survives and folds in after /pi-handoff resume.
+ *
+ * Commands: /pi-handoff status|flush|project|pin|unpin|clear|pause|resume
  * Tool:     handoff(status|flush|pin|unpin) — agent-callable
- * Env:      PI_HANDOFF_MODEL=provider/id  PI_HANDOFF_THRESHOLD_CHARS=8000
- *           PI_HANDOFF_THRESHOLD_TURNS=3  PI_HANDOFF_DIR=<dir>  PI_HANDOFF_DEBUG=1
+ * Env:      PI_HANDOFF_MODEL=provider/id  PI_HANDOFF_THRESHOLD_CHARS=24000
+ *           PI_HANDOFF_THRESHOLD_TURNS=20  PI_HANDOFF_DIR=<dir>  PI_HANDOFF_DEBUG=1
  */
 
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -43,18 +48,18 @@ import { Type } from "typebox";
 import { Collector } from "./collector";
 import { Injector } from "./injector";
 import { redact } from "./redact";
-import { HandoffStore, PROJECT_KNOWLEDGE_CAP_CHARS, PROJECT_SECTIONS, listBranchDocs, migrateProjectKey, type ProjectCandidate, type ProjectSection } from "./store";
+import { HandoffStore, PROJECT_KNOWLEDGE_CAP_CHARS, PROJECT_SECTIONS, listBranchDocs, migrateProjectKey, orphanSubdirStores, storeHome, type ProjectCandidate, type ProjectSection } from "./store";
 import { runProjectExtraction, runRefresh } from "./summarizer";
 
 /** Character ceiling: force an early refresh once this many new chars accumulate,
  * even before the turn backstop fires — a safety valve for heavy/monster turns. */
 const CHAR_THRESHOLD = (() => {
-	const n = Number(process.env.PI_HANDOFF_THRESHOLD_CHARS ?? 8_000);
+	const n = Number(process.env.PI_HANDOFF_THRESHOLD_CHARS ?? 24_000);
 	return Number.isFinite(n) ? Math.max(200, Math.floor(n)) : 8_000;
 })();
 /** Turn backstop: auto-refresh every this many turns. 0 disables it (chars only). */
 const TURN_THRESHOLD = (() => {
-	const n = Math.floor(Number(process.env.PI_HANDOFF_THRESHOLD_TURNS ?? 3));
+	const n = Math.floor(Number(process.env.PI_HANDOFF_THRESHOLD_TURNS ?? 20));
 	return Number.isFinite(n) && n >= 0 ? n : 3;
 })();
 const REFRESH_TIMEOUT_MS = 120_000;
@@ -90,26 +95,55 @@ function isPidAlive(pid: number): boolean {
 const projectRootCache = new Map<string, string>();
 
 /**
+ * Nearest ancestor of `cwd` (inclusive) containing a `.git` entry, or null.
+ *
+ * `.git` may be a directory (ordinary clone) or a FILE holding `gitdir: …`
+ * (linked worktree, submodule); either way the directory holding it is that
+ * checkout's top level, which is what we key the store on. Pure filesystem —
+ * no subprocess, and unaffected by git's safe.directory refusal or a missing
+ * git binary, both of which silently downgrade `git rev-parse` to a per-
+ * subdirectory store.
+ */
+function findGitRoot(cwd: string): string | null {
+	let dir = resolve(cwd);
+	// Stop at the filesystem root: dirname("/") === "/" (and "C:\\" on Windows).
+	for (;;) {
+		if (existsSync(join(dir, ".git"))) return dir;
+		const parent = dirname(dir);
+		if (parent === dir) return null;
+		dir = parent;
+	}
+}
+
+/**
  * The identity of "the project": the git repo/worktree top-level when `cwd`
  * is inside one, else `cwd` itself. Opening the agent from a SUBDIRECTORY of
  * the repo must not mint a second project with its own handoffs and pins —
  * the repo is the project, wherever inside it you stood when you launched.
  * Cached per cwd; a `git init` mid-session is picked up on the next session.
+ *
+ * The `.git` walk decides it whenever one is found; `git rev-parse` is only a
+ * fallback for the exotic cases the walk can't see (GIT_DIR / GIT_WORK_TREE
+ * pointing elsewhere). Doing it in that order also spares the common case a
+ * subprocess.
  */
 export function resolveProjectRoot(cwd: string): string {
 	const hit = projectRootCache.get(cwd);
 	if (hit) return hit;
-	let root = cwd;
-	try {
-		const top = execSync("git rev-parse --show-toplevel", {
-			cwd,
-			stdio: ["ignore", "pipe", "ignore"],
-			encoding: "utf8",
-			timeout: 2000,
-		}).trim();
-		if (top) root = top;
-	} catch {
-		// not a repo — the working directory itself is the project
+	const gitRoot = findGitRoot(cwd);
+	let root = gitRoot ?? cwd;
+	if (!gitRoot) {
+		try {
+			const top = execSync("git rev-parse --show-toplevel", {
+				cwd,
+				stdio: ["ignore", "pipe", "ignore"],
+				encoding: "utf8",
+				timeout: 2000,
+			}).trim();
+			if (top) root = top;
+		} catch {
+			// not a repo — the working directory itself is the project
+		}
 	}
 	projectRootCache.set(cwd, root);
 	return root;
@@ -198,6 +232,15 @@ export default function piHandoff(pi: ExtensionAPI) {
 	let injector: Injector | null = null;
 	/** Git branch the current store is scoped to ("" until session_start). */
 	let currentBranch = "";
+	/**
+	 * Session-scoped mute (/pi-handoff pause). Deliberately in-memory and never
+	 * persisted: a new session always starts recording, so a pause can't outlive
+	 * the conversation it was meant for. Suppresses collection and refresh only —
+	 * injection stays on, so the agent keeps reading handoff.md and project.md.
+	 */
+	let paused = false;
+	/** True when the extension should be collecting and folding right now. */
+	const recording = () => !!store && !paused;
 
 	// Refresh queue state — deliberately in-memory only. Persisted lock state
 	// wedges the queue after a crash; every session starts fresh at idle.
@@ -229,12 +272,12 @@ export default function piHandoff(pi: ExtensionAPI) {
 	function status(ctx: Ctx, modelOverride?: { name?: string }): void {
 		if (!ctx.hasUI || !store) return;
 		const s = store;
-		// Two visible states (plus off): ✓ Synced ↔ ↻ Syncing. A small not-yet-folded
+		// Two visible states (plus paused): ✓ Synced ↔ ↻ Syncing. A small not-yet-folded
 		// buffer is the normal steady state under ✓ Synced — the next fold fires at
 		// TURN_THRESHOLD turns or CHAR_THRESHOLD chars (→ ↻ Syncing). pendingChars
 		// stays internal (drives shouldAutoRefresh); exact counts live in status.
 		let state: string;
-		if (!s.meta.enabled) state = "○ off";
+		if (paused) state = "⏸ Paused";
 		else if (busy) state = "↻ Syncing";
 		else state = "✓ Synced";
 		const projectSuggestions = s.readProjectCandidates().filter((c) => c.status === "suggested").length;
@@ -311,7 +354,11 @@ export default function piHandoff(pi: ExtensionAPI) {
 	}
 
 	function drain(ctx: Ctx, opts: { force?: boolean; anyPending?: boolean; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<unknown> | null {
-		if (!store || !store.meta.enabled) return null;
+		if (!store) return null;
+		// While paused only an explicit force may fold — in practice just the
+		// /pi-handoff flush the user typed; every automatic caller checks `paused`
+		// before reaching this point.
+		if (paused && !opts.force) return null;
 		if (busy) return inFlight; // coalesce; pending work still tracked via pendingChars/turnsSinceRefresh
 		const wanted = opts.force
 			? store.pendingChars > 0 || !!opts.anyPending
@@ -370,14 +417,24 @@ export default function piHandoff(pi: ExtensionAPI) {
 			claimOwnership(sid);
 			clearOfferPending = event.reason === "resume" && HandoffStore.hasRealContent(s.readHandoff());
 			debug(`session_start: branch=${currentBranch} reason=${event.reason} root=${s.root}`);
+			// Stores left behind by launches from inside the repo before repo-root
+			// keying. Told once, at start; never touched automatically.
+			const orphans = orphanSubdirStores(resolveProjectRoot(ctx.cwd));
+			if (orphans.length > 0)
+				notify(ctx, `pi-handoff: ${orphans.length} older handoff store(s) keyed to a subdirectory of this repo are not being read:\n${orphans.map((p) => `  ${p}`).join("\n")}\nThis session uses the repo root. Import anything worth keeping with /pi-handoff project add, or delete those directories under ${storeHome()}.`, "warning");
 		} catch (e) {
 			debug(`session_start failed: ${e}`);
 			notify(ctx, `pi-handoff failed to initialize: ${e instanceof Error ? e.message : e}`, "error");
 		}
 	});
 
+	// The three buffering handlers below check `recording()` rather than only
+	// turn_end: a prompt or tool result buffered mid-pause would otherwise be
+	// flushed into the FIRST post-resume turn, which is exactly the gap content
+	// the pause promised to leave out.
 	pi.on("message_end", async (event) => {
 		try {
+			if (!recording()) return;
 			collector?.onMessageEnd(event.message as any);
 		} catch (e) {
 			debug(String(e));
@@ -386,6 +443,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("tool_execution_start", async (event) => {
 		try {
+			if (!recording()) return;
 			collector?.onToolStart(event.toolCallId, event.toolName, event.args);
 		} catch (e) {
 			debug(String(e));
@@ -394,6 +452,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("tool_execution_end", async (event) => {
 		try {
+			if (!recording()) return;
 			collector?.onToolEnd(event.toolCallId, event.toolName, event.isError);
 		} catch (e) {
 			debug(String(e));
@@ -413,7 +472,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("turn_end", async (event, ctx) => {
 		try {
-			if (!collector || !store?.meta.enabled) return;
+			if (!collector || !recording()) return;
 			collector.onTurnEnd(event);
 			status(ctx);
 		} catch (e) {
@@ -423,7 +482,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("agent_settled", async (_event, ctx) => {
 		try {
-			if (!store?.meta.enabled) return;
+			if (!recording()) return;
 			drain(ctx)?.catch(() => {}); // never block the agent loop
 		} catch (e) {
 			debug(String(e));
@@ -431,13 +490,21 @@ export default function piHandoff(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_before_compact", async (_event, ctx) => {
-		// flush so no work lives only in soon-to-be-compacted turns
+		// flush so no work lives only in soon-to-be-compacted turns. Not while
+		// paused: pre-pause events are already durable in events.jsonl, so
+		// skipping the fold loses nothing and keeps the promise that a pause
+		// writes no handoff.md.
+		if (paused) return;
 		await drain(ctx, { force: true })?.catch(() => {});
 	});
 
 	pi.on("session_compact", async () => {
 		try {
-			if (!store?.meta.enabled) return;
+			// Compaction dropped the history the frozen injection was allowed to go
+			// stale against, so the next request must rebuild it. The cache is cold
+			// after a compaction anyway, making this the free moment to refresh.
+			injector?.invalidate();
+			if (!store || paused) return;
 			store.appendEvent({ sessionId: store.meta.sessionId, turn: -1, type: "compact" });
 		} catch (e) {
 			debug(String(e));
@@ -514,7 +581,9 @@ export default function piHandoff(pi: ExtensionAPI) {
 			// if it changed, swap to that branch's store before this turn is collected.
 			// before_agent_start fires before the user message_end, so the new
 			// collector captures this turn's prompt (nothing buffered is lost).
-			if (store?.meta.enabled) {
+			// Runs while paused too: swapping stores writes no session content and
+			// keeps the status bar's branch honest for when recording resumes.
+			if (store) {
 				const b = detectBranch(ctx.cwd, currentBranch || "default");
 				if (b !== currentBranch) {
 					const sid = ctx.sessionManager.getSessionId?.() ?? "";
@@ -535,7 +604,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 				}
 			}
 
-			if (!clearOfferPending || !store?.meta.enabled || !ctx.hasUI) return;
+			// Not while paused: accepting the offer clears the handoff, and a pause
+			// means "don't touch it". The offer stays armed for the first turn after
+			// resume.
+			if (!clearOfferPending || !store || paused || !ctx.hasUI) return;
 			clearOfferPending = false; // offer at most once per branch adoption
 			const prompt = event.prompt ?? "";
 			if (prompt.length < 80) return; // short prompts carry no task signal
@@ -567,6 +639,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (!store) return;
 		store.appendEvent({ sessionId: store.meta.sessionId, turn: -1, type: "clear" });
 		store.clearTaskState();
+		injector?.invalidate(); // the document the snapshot described is gone
 		store.markRefreshed(store.meta.nextSeq - 1); // pre-clear events are not re-merged
 		store.saveMetaSync();
 	}
@@ -575,7 +648,9 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("context", async (event) => {
 		try {
-			if (!injector || !store?.meta.enabled) return undefined;
+			// Injection deliberately survives a pause: pausing stops WRITING the
+			// handoff, it does not blind the agent to what is already recorded.
+			if (!injector || !store) return undefined;
 			const msg = injector.buildMessage();
 			if (!msg) return undefined;
 			return { messages: [msg as never, ...event.messages] };
@@ -594,8 +669,8 @@ export default function piHandoff(pi: ExtensionAPI) {
 	 * (durable, branch-independent, costly to rediscover — otherwise the file
 	 * grows into noise that every future session pays to read).
 	 *
-	 * Deliberately narrower than the slash command: no clear/on/off. Wiping the
-	 * current task's handoff or disabling collection is the user's call; the
+	 * Deliberately narrower than the slash command: no clear, no pause/resume.
+	 * Wiping the current task's handoff or muting collection is the user's call; the
 	 * agent may curate memory, never silently destroy it. Pins themselves are
 	 * safe to delegate because every guardrail is program-side: dedupe makes
 	 * re-pinning a no-op, ambiguous unpin removes nothing, and all writes are
@@ -670,10 +745,13 @@ export default function piHandoff(pi: ExtensionAPI) {
 						return txt(`No pin matches "${params.note}". Current pins:\n${s.pinnedNotes().join("\n") || "(none)"}`);
 					}
 					case "flush": {
+						// The user paused this session; only they may unpause or force a
+						// fold from here on. The agent asking is not that.
+						if (paused) return txt("pi-handoff: paused for this session — nothing is being recorded or folded. The user can resume with /pi-handoff resume.");
 						const wasBusy = busy;
 						const errsBefore = errors;
 						const p = drain(ctx, { force: true, anyPending: true, signal });
-						if (!p) return txt(s.meta.enabled ? "pi-handoff: nothing to flush" : "pi-handoff: disabled — no collection, refresh, or injection");
+						if (!p) return txt("pi-handoff: nothing to flush");
 						await p.catch(() => {});
 						if (signal?.aborted) return txt("pi-handoff: flush aborted — buffered events are kept and retried automatically.");
 						if (errors > errsBefore)
@@ -698,12 +776,12 @@ export default function piHandoff(pi: ExtensionAPI) {
 		["unpin", "Remove a pinned rule by substring match"],
 		["project", "Manage project-wide knowledge (status|refresh|review|add|forget)"],
 		["clear", "Start a fresh handoff for a new task (pins are kept)"],
-		["on", "Enable pi-handoff"],
-		["off", "Disable pi-handoff"],
+		["pause", "Stop recording for this session (the gap is never written)"],
+		["resume", "Start recording again"],
 	] as const;
 
 	pi.registerCommand("pi-handoff", {
-		description: "pi-handoff: branch handoff + shared project knowledge (status|flush|project|pin|unpin|clear|on|off)",
+		description: "pi-handoff: branch handoff + shared project knowledge (status|flush|project|pin|unpin|clear|pause|resume)",
 		getArgumentCompletions: (prefix: string) =>
 			SUBCOMMANDS.filter(([name]) => name.startsWith(prefix)).map(([value, label]) => ({ value, label })),
 		handler: async (args, ctx: ExtensionCommandContext) => {
@@ -723,12 +801,12 @@ export default function piHandoff(pi: ExtensionAPI) {
 						return await cmdProject(ctx, rest);
 					case "clear":
 						return await cmdReset(ctx);
-					case "on":
-						return cmdToggle(ctx, true);
-					case "off":
-						return cmdToggle(ctx, false);
+					case "pause":
+						return cmdPause(ctx);
+					case "resume":
+						return cmdResume(ctx);
 					default:
-						notify(ctx, `pi-handoff: unknown subcommand "${sub}" — try status|flush|pin|unpin|clear|on|off`, "error");
+						notify(ctx, `pi-handoff: unknown subcommand "${sub}" — try status|flush|pin|unpin|project|clear|pause|resume`, "error");
 				}
 			} catch (e) {
 				notify(ctx, `pi-handoff ${sub} failed: ${e instanceof Error ? e.message : e}`, "error");
@@ -744,7 +822,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 			`pi-handoff — store: ${store.root}`,
 			`  branch: ${currentBranch}`,
 			`  project: ${m.projectPath || cwd}`,
-			`  enabled: ${m.enabled}   queue: ${busy ? "running" : "idle"}`,
+			`  recording: ${paused ? "paused (this session; injection still active)" : "yes"}   queue: ${busy ? "running" : "idle"}`,
 			`  events: ${m.eventLineCount}/1000 lines · latest seq ${m.nextSeq - 1} · pending ${kb(store.pendingChars)} · ${store.turnsSinceRefresh} turns (fold ≥${TURN_THRESHOLD} turns or ≥${kb(CHAR_THRESHOLD)} chars)`,
 			`  handoff.md: ${kb(fsSize(store.handoffPath))} (refreshed at seq ${m.lastRefreshedSeq})`,
 			`  pinned: ${store.pinnedNotes().length} project-level note(s) in ${store.projectDocPath}`,
@@ -960,12 +1038,27 @@ export default function piHandoff(pi: ExtensionAPI) {
 		notify(ctx, "pi-handoff: clear. Fresh handoff.md ready for the next task.");
 	}
 
-	function cmdToggle(ctx: Ctx, enabled: boolean): void {
+	/**
+	 * Mute recording for the rest of this session. Anything already buffered
+	 * before the pause stays buffered and folds in after resume; the paused
+	 * stretch itself is never collected, so there is nothing to filter out
+	 * later. An in-flight refresh is aborted — its events are durable and
+	 * retried on the next fold.
+	 */
+	function cmdPause(ctx: Ctx): void {
 		if (!store) return;
-		if (!enabled && activeAbort) activeAbort.abort(new Error("pi-handoff: disabled"));
-		store.meta.enabled = enabled;
-		store.saveMetaSync();
+		if (paused) return notify(ctx, "pi-handoff: already paused — /pi-handoff resume to start recording again");
+		paused = true;
+		if (activeAbort) activeAbort.abort(new Error("pi-handoff: paused"));
 		status(ctx);
-		notify(ctx, enabled ? "pi-handoff: enabled" : "pi-handoff: disabled (no collection, refresh, or injection)");
+		notify(ctx, "pi-handoff: paused for this session — this conversation is not recorded until /pi-handoff resume. The existing handoff is still read by the agent, and work buffered before now is kept.");
+	}
+
+	function cmdResume(ctx: Ctx): void {
+		if (!store) return;
+		if (!paused) return notify(ctx, "pi-handoff: already recording");
+		paused = false;
+		status(ctx);
+		notify(ctx, "pi-handoff: recording again — nothing from the paused stretch was written.");
 	}
 }

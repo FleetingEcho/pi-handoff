@@ -1,11 +1,13 @@
 /**
- * Injector — inserts the current handoff.md into the LLM context on every
- * request, via pi's `context` event.
+ * Injector — inserts the handoff.md into the LLM context on every request, via
+ * pi's `context` event.
  *
  * The event receives a deep copy of the message array: modifications are
  * safe, apply to the current call only, and are never persisted into the
- * session file. The injected content is therefore always as fresh as the
- * file on disk.
+ * session file.
+ *
+ * The injected text is a per-session snapshot rather than a fresh read — see
+ * `frozen` below for why that is a large token saving and costs nothing.
  */
 
 import { readFileSync, statSync } from "node:fs";
@@ -18,8 +20,37 @@ interface CacheEntry {
 	text: string;
 }
 
+type InjectedMessage = { role: "custom"; customType: string; content: string; display: boolean; timestamp: number };
+
 export class Injector {
 	private cache = new Map<string, CacheEntry>();
+
+	/**
+	 * Session-stable snapshot of the injected text.
+	 *
+	 * This block sits at the FRONT of the provider's cached prefix. Rebuilding it
+	 * per request means every background fold rewrites that prefix, invalidating
+	 * the prompt cache for the WHOLE conversation — re-paying full input price
+	 * for every earlier message, which costs far more than the fold that caused
+	 * it. Between folds the text is identical anyway, so the rebuild bought
+	 * nothing and the cache miss was pure loss.
+	 *
+	 * So it is built once and frozen for the session. Nothing is lost by going
+	 * stale: the model lived through the turns a fold summarises, so re-injecting
+	 * them tells it what it already knows. `invalidate()` is called only where
+	 * the frozen text genuinely stops matching the conversation — after a
+	 * compaction (that history has left the window) and after a clear (the
+	 * document it described is gone). A branch switch builds a new Injector.
+	 *
+	 * Freezing the whole object also pins `timestamp`, so a serialized timestamp
+	 * cannot bust the cache on every single request.
+	 */
+	private frozen: InjectedMessage | null = null;
+
+	/** Drop the snapshot so the next request rebuilds it from disk. */
+	invalidate(): void {
+		this.frozen = null;
+	}
 
 	constructor(private store: HandoffStore) {}
 
@@ -37,7 +68,8 @@ export class Injector {
 	}
 
 	/** Build the synthetic context message, or return null when there is nothing worth injecting. */
-	buildMessage(): { role: "custom"; customType: string; content: string; display: boolean; timestamp: number } | null {
+	buildMessage(): InjectedMessage | null {
+		if (this.frozen) return this.frozen;
 		const handoff = this.readFresh(this.store.handoffPath);
 		const projectKnowledge = this.store.readProjectKnowledge();
 		const pins = this.store.pinnedNotes();
@@ -64,12 +96,15 @@ ${body}
 
 </branch-handoff>${project}${pinned}`;
 
-		return {
+		// Only a non-null build is frozen: a session that starts with an empty
+		// handoff must keep looking until there is something to inject.
+		this.frozen = {
 			role: "custom",
 			customType: "pi-handoff",
 			content,
 			display: false,
 			timestamp: Date.now(),
 		};
+		return this.frozen;
 	}
 }
