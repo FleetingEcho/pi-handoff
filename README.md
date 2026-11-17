@@ -6,7 +6,7 @@ The extension records recent turns, periodically folds them into concise Markdow
 
 ## Install
 
-Requires pi ≥ 0.83.
+Requires pi ≥ 1.5.0. The extension is tested against pi 1.5.2.
 
 ```bash
 pi install git:github.com/FleetingEcho/pi-handoff
@@ -171,6 +171,8 @@ A collected turn contributes at most about 12k excerpt characters and 200 change
 ## Reliability and privacy
 
 - Events are appended synchronously before background summarization.
+- Compaction never waits for the handoff summarizer; durable events refresh in the background after compaction.
+- Background model calls use pi's model registry, so OAuth, cloud credentials, custom providers, and virtual models work the same way as the active session.
 - Document and metadata replacements use unique temporary files plus atomic rename.
 - Short-lived filesystem locks coordinate event, metadata, project knowledge, and proposal writes across pi processes; model calls never hold a lock.
 - A background refresh refuses to overwrite a handoff edited while its model call was running.

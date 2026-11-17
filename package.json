@@ -1,6 +1,6 @@
 {
   "name": "pi-handoff",
-  "version": "0.11.0",
+  "version": "0.12.0",
   "type": "module",
   "description": "Self-maintaining handoff.md per working directory + git branch for pi, stored under ~/.agent/agent-handoff.",
   "license": "MIT",
@@ -10,6 +10,7 @@
     "handoff"
   ],
   "pi": {
+    "changelogPath": "./CHANGELOG.md",
     "extensions": [
       "./index.ts"
     ],
@@ -31,6 +32,7 @@
     }
   },
   "scripts": {
+    "test": "bun test",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

@@ -4,8 +4,7 @@
  * Never blocks the agent loop; callers serialize execution via a queue.
  */
 
-import { uuidv7 } from "@earendil-works/pi-ai";
-import { complete } from "@earendil-works/pi-ai/compat";
+import { randomUUID } from "node:crypto";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { redact } from "./redact";
 import {
@@ -30,23 +29,16 @@ const DEBUG = () => !!process.env.PI_HANDOFF_DEBUG;
 const CONFIGURED = process.env.PI_HANDOFF_MODEL;
 
 async function resolveModel(ctx: ModelCtx): Promise<{ model: NonNullable<ExtensionContext["model"]>; source: string } | null> {
-	const tryModel = async (model: NonNullable<ExtensionContext["model"]> | undefined, source: string) => {
-		if (!model) return null;
-		const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model).catch(() => null);
-		if (!auth || !auth.ok || !auth.apiKey) return null;
-		return { model, source };
-	};
-
 	if (CONFIGURED) {
 		const [provider, ...rest] = CONFIGURED.split("/");
 		const id = rest.join("/");
 		if (provider && id) {
-			const hit = await tryModel(ctx.modelRegistry.find(provider, id), `config ${CONFIGURED}`);
-			if (hit) return hit;
+			const model = ctx.modelRegistry.find(provider, id);
+			if (model) return { model, source: `config ${CONFIGURED}` };
 		}
 	}
 
-	return tryModel(ctx.model ?? undefined, "active model");
+	return ctx.model ? { model: ctx.model, source: "active model" } : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -63,9 +55,6 @@ async function callLlm(ctx: ModelCtx, systemPrompt: string, userText: string, ti
 	const resolved = await resolveModel(ctx);
 	if (!resolved) throw new Error("pi-handoff: no model with auth available for summarization");
 
-	const auth = await ctx.modelRegistry.getApiKeyAndHeaders(resolved.model);
-	if (!auth.ok || !auth.apiKey) throw new Error(`pi-handoff: auth failed for ${resolved.model.provider}/${resolved.model.id}`);
-
 	const ac = new AbortController();
 	const timer = setTimeout(() => ac.abort(new Error(`pi-handoff: summarizer timed out after ${timeoutMs}ms`)), timeoutMs);
 	// Propagate an external abort (e.g. session shutdown) into the request so
@@ -75,23 +64,23 @@ async function callLlm(ctx: ModelCtx, systemPrompt: string, userText: string, ti
 		else abortSignal.addEventListener("abort", () => ac.abort(abortSignal.reason), { once: true });
 	}
 	try {
-		const response = await complete(
+		const response = await ctx.modelRegistry.complete(
 			resolved.model,
 			{
 				systemPrompt,
 				messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }],
 			},
 			{
-				apiKey: auth.apiKey,
-				headers: auth.headers,
-				env: auth.env,
 				// Reasoning models burn thinking tokens against this cap; 8192 truncated
 				// folds on such models (finish_reason=length → missing sections → counted
 				// error). Give the call the model's output budget (capped at 32k).
 				maxTokens: Math.max(8192, Math.min(32_768, resolved.model.maxTokens ?? 8192)),
 				signal: ac.signal,
 				cacheRetention: "none",
-				sessionId: uuidv7(),
+				sessionId: randomUUID(),
+				// A handoff refresh is a standalone background request, not part of the
+				// active conversation's Anthropic/OpenAI continuation thread.
+				disableContinuation: true,
 			},
 		);
 		if (response.stopReason === "aborted") throw new Error("pi-handoff: summarizer aborted");

@@ -71,8 +71,7 @@ export class Injector {
 	buildMessage(): InjectedMessage | null {
 		if (this.frozen) return this.frozen;
 		const handoff = this.readFresh(this.store.handoffPath);
-		const projectKnowledge = this.store.readProjectKnowledge();
-		const pins = this.store.pinnedNotes();
+		const { knowledge: projectKnowledge, pins } = this.store.parseProjectDoc(this.readFresh(this.store.projectDocPath));
 		if (!HandoffStore.hasRealContent(handoff) && !HandoffStore.hasRealContent(projectKnowledge) && pins.length === 0) return null;
 
 		const body =

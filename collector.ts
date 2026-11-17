@@ -89,6 +89,13 @@ export class Collector {
 	/** turn_end: assemble + append one redacted event. */
 	onTurnEnd(event: TurnEndEvent): HandoffEvent {
 		const excerpts: Excerpt[] = [];
+		if (event.outcome !== "completed") {
+			excerpts.push({
+				role: "tool",
+				toolName: "pi-handoff",
+				text: `[turn ${event.outcome}; tool changes below may have happened, but do not treat the assistant response as completed work]`,
+			});
+		}
 
 		for (const userText of this.pendingUser.splice(0)) {
 			excerpts.push({ role: "user", text: userText });

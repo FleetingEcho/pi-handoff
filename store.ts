@@ -3,7 +3,7 @@
  *
  * Nothing is written into the project. Every project gets its own directory
  * under the store root, named after the project root's absolute path (see
- * resolveProjectRoot in index.ts — the git repo/worktree top-level when the
+ * resolveProjectRoot in git.ts — the git repo/worktree top-level when the
  * working directory is inside a repo, so opening the agent from a
  * subdirectory of the same repo lands on the SAME store; outside git the
  * working directory itself is the key):
@@ -33,7 +33,6 @@ import { createHash, randomUUID } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, renameSync, rmdirSync, statSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, join, resolve } from "node:path";
-import { CONFIG_DIR_NAME } from "@earendil-works/pi-coding-agent";
 import { redact } from "./redact";
 
 export const HANDOFF_SECTIONS = [
@@ -144,7 +143,7 @@ export function storeHome(): string {
  * migration in initSync() to carry existing stores forward to storeHome().
  */
 function legacyStoreHome(): string {
-	return join(homedir(), CONFIG_DIR_NAME, "agent", "pi-handoff");
+	return join(homedir(), ".pi", "agent", "pi-handoff");
 }
 
 /** Longest directory name most filesystems accept, minus room for a suffix. */
@@ -858,7 +857,19 @@ export class HandoffStore {
 
 	/** Model-maintained, project-wide knowledge without the protected pin block. */
 	readProjectKnowledge(): string {
-		return this.splitPinned(this.readProjectDoc()).body.trim();
+		return this.parseProjectDoc(this.readProjectDoc()).knowledge;
+	}
+
+	/** Parse one project.md read into both injected tiers. */
+	parseProjectDoc(doc: string): { knowledge: string; pins: string[] } {
+		const { body, pinned } = this.splitPinned(doc);
+		return {
+			knowledge: body.trim(),
+			pins: (pinned ?? "")
+				.split("\n")
+				.filter((line) => line.startsWith("- ") && !line.startsWith("- (pinned notes") && !line.startsWith("- (pi-handoff:"))
+				.map((line) => line.trim()),
+		};
 	}
 
 	private ensureProjectLayout(): void {
@@ -914,10 +925,7 @@ export class HandoffStore {
 
 	/** Pinned notes as bullet lines, excluding the placeholder. Empty when none. */
 	pinnedNotes(): string[] {
-		return (this.splitPinned(this.readProjectDoc()).pinned ?? "")
-			.split("\n")
-			.filter((l) => l.startsWith("- ") && !l.startsWith("- (pinned notes") && !l.startsWith("- (pi-handoff:"))
-			.map((l) => l.trim());
+		return this.parseProjectDoc(this.readProjectDoc()).pins;
 	}
 
 	/** Assemble the final doc. Pins are no longer part of handoff.md — if the

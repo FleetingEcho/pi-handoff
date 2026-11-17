@@ -36,16 +36,16 @@
  *           PI_HANDOFF_THRESHOLD_TURNS=20  PI_HANDOFF_DIR=<dir>  PI_HANDOFF_DEBUG=1
  */
 
-import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync, statSync } from "node:fs";
+import { statSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Collector } from "./collector";
+import { activeGitBranches, detectBranch, resolveProjectRoot } from "./git";
 import { Injector } from "./injector";
 import { redact } from "./redact";
 import { HandoffStore, PROJECT_KNOWLEDGE_CAP_CHARS, PROJECT_SECTIONS, listBranchDocs, migrateProjectKey, orphanSubdirStores, storeHome, type ProjectCandidate, type ProjectSection } from "./store";
@@ -91,129 +91,6 @@ function isPidAlive(pid: number): boolean {
 	}
 }
 
-/** cwd -> project root cache: repo membership of a directory doesn't change mid-session. */
-const projectRootCache = new Map<string, string>();
-
-/**
- * Nearest ancestor of `cwd` (inclusive) containing a `.git` entry, or null.
- *
- * `.git` may be a directory (ordinary clone) or a FILE holding `gitdir: …`
- * (linked worktree, submodule); either way the directory holding it is that
- * checkout's top level, which is what we key the store on. Pure filesystem —
- * no subprocess, and unaffected by git's safe.directory refusal or a missing
- * git binary, both of which silently downgrade `git rev-parse` to a per-
- * subdirectory store.
- */
-function findGitRoot(cwd: string): string | null {
-	let dir = resolve(cwd);
-	// Stop at the filesystem root: dirname("/") === "/" (and "C:\\" on Windows).
-	for (;;) {
-		if (existsSync(join(dir, ".git"))) return dir;
-		const parent = dirname(dir);
-		if (parent === dir) return null;
-		dir = parent;
-	}
-}
-
-/**
- * The identity of "the project": the git repo/worktree top-level when `cwd`
- * is inside one, else `cwd` itself. Opening the agent from a SUBDIRECTORY of
- * the repo must not mint a second project with its own handoffs and pins —
- * the repo is the project, wherever inside it you stood when you launched.
- * Cached per cwd; a `git init` mid-session is picked up on the next session.
- *
- * The `.git` walk decides it whenever one is found; `git rev-parse` is only a
- * fallback for the exotic cases the walk can't see (GIT_DIR / GIT_WORK_TREE
- * pointing elsewhere). Doing it in that order also spares the common case a
- * subprocess.
- */
-export function resolveProjectRoot(cwd: string): string {
-	const hit = projectRootCache.get(cwd);
-	if (hit) return hit;
-	const gitRoot = findGitRoot(cwd);
-	let root = gitRoot ?? cwd;
-	if (!gitRoot) {
-		try {
-			const top = execSync("git rev-parse --show-toplevel", {
-				cwd,
-				stdio: ["ignore", "pipe", "ignore"],
-				encoding: "utf8",
-				timeout: 2000,
-			}).trim();
-			if (top) root = top;
-		} catch {
-			// not a repo — the working directory itself is the project
-		}
-	}
-	projectRootCache.set(cwd, root);
-	return root;
-}
-
-/**
- * Best-effort current git branch of `cwd`. Returns "default" when not in a repo
- * or on any error, and "detached-<short-sha>" for detached HEAD. Cheap (no FS
- * walk); called once per turn, so a mid-session `git checkout` is picked up.
- *
- * The name comes from the FULL symbolic ref on purpose: `rev-parse
- * --abbrev-ref` and `symbolic-ref --short` both apply git's ref-shortening
- * rules, which answer "heads/<name>" whenever the short name is ambiguous
- * (a tag sharing the branch's name) and revert to the bare name once the
- * ambiguity disappears — flipping one branch between two store dirs and
- * making its handoff look blank. `refs/heads/<name>` is identical in both
- * states, so we strip the prefix ourselves.
- */
-export function detectBranch(cwd: string, fallback = "default"): string {
-	const run = (args: string) =>
-		execSync(args, { cwd, stdio: ["ignore", "pipe", "ignore"], encoding: "utf8", timeout: 2000 }).trim();
-	try {
-		// symbolic-ref exits non-zero on a detached HEAD — that is the normal
-		// case, not an error, so it gets its own try instead of failing the whole probe.
-		let ref = "";
-		try {
-			ref = run("git symbolic-ref -q HEAD");
-		} catch {
-			// detached
-		}
-		if (ref.startsWith("refs/heads/")) return ref.slice("refs/heads/".length);
-		if (ref) return ref.replace(/^refs\//g, ""); // exotic ref (notes, worktree...) — still deterministic
-		// detached HEAD
-		try {
-			const sha = run("git rev-parse --short HEAD");
-			return sha ? `detached-${sha}` : fallback;
-		} catch {
-			return fallback;
-		}
-	} catch {
-		// A transient git failure must not make a live session jump into the
-		// non-git store. At session start the fallback is still "default".
-		return fallback;
-	}
-}
-
-/** Current local and remote branch names. Null means detection failed, so
- * callers must not filter durable stores on uncertain evidence. */
-function activeGitBranches(cwd: string): Set<string> | null {
-	try {
-		const refs = execSync("git for-each-ref --format=%(refname) refs/heads refs/remotes", {
-			cwd,
-			stdio: ["ignore", "pipe", "ignore"],
-			encoding: "utf8",
-			timeout: 3_000,
-		});
-		const branches = new Set<string>();
-		for (const ref of refs.split("\n").map((line) => line.trim()).filter(Boolean)) {
-			if (ref.startsWith("refs/heads/")) branches.add(ref.slice("refs/heads/".length));
-			else if (ref.startsWith("refs/remotes/")) {
-				const name = ref.slice("refs/remotes/".length).replace(/^[^/]+\//, "");
-				if (name && name !== "HEAD") branches.add(name);
-			}
-		}
-		return branches;
-	} catch {
-		return null;
-	}
-}
-
 /** Best-effort extension directory (used to locate the bundled skill). */
 const EXT_DIR: string = (() => {
 	try {
@@ -247,8 +124,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 	let busy = false;
 	let inFlight: Promise<unknown> | null = null;
 	let errors = 0;
+	let lastError: string | null = null;
 	let lastModel: string | null = null;
 	let clearOfferPending = false;
+	let suggestionCache: { path: string; mtimeMs: number; size: number; ino: number; count: number } | null = null;
 	/** AbortController for the currently-running drain; aborted on shutdown or a branch switch. */
 	let activeAbort: AbortController | null = null;
 
@@ -268,6 +147,17 @@ export default function piHandoff(pi: ExtensionAPI) {
 			return 0;
 		}
 	};
+	const projectSuggestionCount = (s: HandoffStore) => {
+		try {
+			const stat = statSync(s.projectCandidatesPath);
+			if (suggestionCache?.path === s.projectCandidatesPath && suggestionCache.mtimeMs === stat.mtimeMs && suggestionCache.size === stat.size && suggestionCache.ino === stat.ino) return suggestionCache.count;
+			const count = s.readProjectCandidates().filter((candidate) => candidate.status === "suggested").length;
+			suggestionCache = { path: s.projectCandidatesPath, mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, count };
+			return count;
+		} catch {
+			return 0;
+		}
+	};
 
 	function status(ctx: Ctx, modelOverride?: { name?: string }): void {
 		if (!ctx.hasUI || !store) return;
@@ -280,11 +170,12 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (paused) state = "⏸ Paused";
 		else if (busy) state = "↻ Syncing";
 		else state = "✓ Synced";
-		const projectSuggestions = s.readProjectCandidates().filter((c) => c.status === "suggested").length;
+		const projectSuggestions = projectSuggestionCount(s);
 		const projectBadge = projectSuggestions > 0 ? ` · ${projectSuggestions} project` : "";
+		const errorBadge = errors > 0 ? ` · ⚠ ${errors}` : "";
 		const branch = currentBranch || "default";
 		const model = modelOverride?.name ?? ctx.model?.name ?? "no-model";
-		ctx.ui.setStatus("pi-handoff", `[Handoff] ${model} ${state} branch:${branch}${projectBadge}`);
+		ctx.ui.setStatus("pi-handoff", `[Handoff] ${model} ${state} branch:${branch}${projectBadge}${errorBadge}`);
 	}
 
 	// ----------------------------------------------------- store adoption
@@ -385,11 +276,15 @@ export default function piHandoff(pi: ExtensionAPI) {
 					batchRemaining = !!r?.remaining;
 					if (r?.modelSource) lastModel = r.modelSource;
 					errors = 0; // success → clear any transient error count
+					lastError = null;
 				} catch (e) {
 					// A shutdown/branch-switch abort is not an error — don't poison the counter.
 					if (!ac.signal.aborted) {
+						const message = e instanceof Error ? e.message : String(e);
 						errors++;
-						debug(`refresh failed: ${e instanceof Error ? e.message : e}`);
+						lastError = message;
+						debug(`refresh failed: ${message}`);
+						if (errors === 1) notify(ctx, `pi-handoff refresh failed; buffered work is safe and will retry automatically: ${message}`, "warning");
 					}
 					break; // events stay buffered; retried on next trigger
 				}
@@ -489,23 +384,16 @@ export default function piHandoff(pi: ExtensionAPI) {
 		}
 	});
 
-	pi.on("session_before_compact", async (_event, ctx) => {
-		// flush so no work lives only in soon-to-be-compacted turns. Not while
-		// paused: pre-pause events are already durable in events.jsonl, so
-		// skipping the fold loses nothing and keeps the promise that a pause
-		// writes no handoff.md.
-		if (paused) return;
-		await drain(ctx, { force: true })?.catch(() => {});
-	});
-
-	pi.on("session_compact", async () => {
+	pi.on("session_compact", async (_event, ctx) => {
 		try {
-			// Compaction dropped the history the frozen injection was allowed to go
-			// stale against, so the next request must rebuild it. The cache is cold
-			// after a compaction anyway, making this the free moment to refresh.
+			// Events were already appended synchronously at turn_end, and Pi's own
+			// compaction summary preserves the live conversation. Refresh only after
+			// compaction and do it in the background: the old implementation blocked
+			// /compact and overflow recovery on another model call for up to 120s.
 			injector?.invalidate();
 			if (!store || paused) return;
 			store.appendEvent({ sessionId: store.meta.sessionId, turn: -1, type: "compact" });
+			drain(ctx, { force: true })?.catch(() => {});
 		} catch (e) {
 			debug(String(e));
 		}
@@ -562,6 +450,13 @@ export default function piHandoff(pi: ExtensionAPI) {
 		for (const w of text.toLowerCase().match(/[a-z0-9]{4,}/g) ?? []) {
 			if (!STOP.has(w)) out.add(w);
 		}
+		// CJK text has no spaces, so word splitting alone treats a whole prompt as
+		// one unrelated token. Character bigrams give the goal-change offer useful
+		// signal for Chinese, Japanese, and Korean prompts without a tokenizer.
+		const cjk = text.match(/[\p{Script=Han}\p{Script=Hiragana}\p{Script=Katakana}\p{Script=Hangul}]+/gu) ?? [];
+		for (const run of cjk) {
+			for (let i = 0; i + 1 < run.length; i++) out.add(run.slice(i, i + 2));
+		}
 		return out;
 	}
 
@@ -609,7 +504,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 			// resume.
 			if (!clearOfferPending || !store || paused || !ctx.hasUI) return;
 			clearOfferPending = false; // offer at most once per branch adoption
-			const prompt = event.prompt ?? "";
+			const prompt = event.messageType === "user" ? event.prompt : "";
 			if (prompt.length < 80) return; // short prompts carry no task signal
 			const goal = extractSection(store.readHandoff(), "Current Goal");
 			if (!goal || looksRelated(goal, prompt)) return;
@@ -734,12 +629,16 @@ export default function piHandoff(pi: ExtensionAPI) {
 						if (!params.note?.trim()) return txt("handoff: action=pin requires a 'note'");
 						if (!s.appendPinned(params.note)) return txt(`pi-handoff: already pinned — no change. Current pins:\n${s.pinnedNotes().join("\n") || "(none)"}`);
 						s.appendEvent({ sessionId: s.meta.sessionId, turn: -1, type: "pin", note: params.note });
+						injector?.invalidate();
 						return txt(`Pinned to ${s.projectDocPath} — applies on every branch of this project and is visible to other agents sharing this store. It appears in context from the next request on.`);
 					}
 					case "unpin": {
 						if (!params.note?.trim()) return txt("handoff: action=unpin requires a 'note' (a substring of the pin to remove)");
 						const { removed, candidates } = s.removePinned(params.note);
-						if (removed) return txt(`Unpinned ${removed}`);
+						if (removed) {
+							injector?.invalidate();
+							return txt(`Unpinned ${removed}`);
+						}
 						if (candidates.length > 1)
 							return txt(`"${params.note}" matches ${candidates.length} pins — nothing removed (ambiguous matches never delete). Be more specific:\n${candidates.join("\n")}`);
 						return txt(`No pin matches "${params.note}". Current pins:\n${s.pinnedNotes().join("\n") || "(none)"}`);
@@ -818,6 +717,8 @@ export default function piHandoff(pi: ExtensionAPI) {
 	function statusText(cwd: string): string | null {
 		if (!store) return null;
 		const m = store.meta;
+		const project = store.parseProjectDoc(store.readProjectDoc());
+		const suggestions = store.readProjectCandidates().filter((candidate) => candidate.status === "suggested").length;
 		return [
 			`pi-handoff — store: ${store.root}`,
 			`  branch: ${currentBranch}`,
@@ -825,10 +726,11 @@ export default function piHandoff(pi: ExtensionAPI) {
 			`  recording: ${paused ? "paused (this session; injection still active)" : "yes"}   queue: ${busy ? "running" : "idle"}`,
 			`  events: ${m.eventLineCount}/1000 lines · latest seq ${m.nextSeq - 1} · pending ${kb(store.pendingChars)} · ${store.turnsSinceRefresh} turns (fold ≥${TURN_THRESHOLD} turns or ≥${kb(CHAR_THRESHOLD)} chars)`,
 			`  handoff.md: ${kb(fsSize(store.handoffPath))} (refreshed at seq ${m.lastRefreshedSeq})`,
-			`  pinned: ${store.pinnedNotes().length} project-level note(s) in ${store.projectDocPath}`,
-			`  project knowledge: ${store.readProjectKnowledge().split("\n").filter((line) => line.startsWith("- ")).length} fact(s) · ${store.readProjectCandidates().filter((c) => c.status === "suggested").length} suggestion(s)`,
-			...store.pinnedNotes().map((n) => `    ${n}`),
+			`  pinned: ${project.pins.length} project-level note(s) in ${store.projectDocPath}`,
+			`  project knowledge: ${project.knowledge.split("\n").filter((line) => line.startsWith("- ")).length} fact(s) · ${suggestions} suggestion(s)`,
+			...project.pins.map((note) => `    ${note}`),
 			`  summarizer: ${m.summarizerUsage.calls} calls, ${m.summarizerUsage.totalTokens} tokens${lastModel ? `, last via ${lastModel}` : ""}`,
+			...(lastError ? [`  last error: ${truncateInMiddle(lastError, 240)}`] : []),
 		].join("\n");
 	}
 
@@ -840,9 +742,11 @@ export default function piHandoff(pi: ExtensionAPI) {
 	async function cmdFlush(ctx: ExtensionCommandContext): Promise<void> {
 		if (!store) return;
 		await ctx.waitForIdle();
+		const errorsBefore = errors;
 		const done = drain(ctx, { force: true, anyPending: true });
 		if (!done) return notify(ctx, "pi-handoff: nothing to flush");
 		await done;
+		if (errors > errorsBefore) return notify(ctx, `pi-handoff: refresh failed; buffered work is safe and will retry automatically${lastError ? `: ${lastError}` : ""}`, "error");
 		notify(ctx, `pi-handoff: handoff.md refreshed · ${kb(fsSize(store.handoffPath))}`);
 	}
 
@@ -851,6 +755,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (!text) return notify(ctx, "usage: /pi-handoff pin <note>", "warning");
 		if (!store.appendPinned(text)) return notify(ctx, "pi-handoff: already pinned — no change");
 		store.appendEvent({ sessionId: store.meta.sessionId, turn: -1, type: "pin", note: text });
+		injector?.invalidate();
 		notify(ctx, `pi-handoff: pinned to ${store.projectDocPath} — applies on every branch of this project`);
 	}
 
@@ -858,7 +763,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (!store) return;
 		if (!text) return notify(ctx, "usage: /pi-handoff unpin <substring of the pin>", "warning");
 		const { removed, candidates } = store.removePinned(text);
-		if (removed) return notify(ctx, `pi-handoff: unpinned ${removed}`);
+		if (removed) {
+			injector?.invalidate();
+			return notify(ctx, `pi-handoff: unpinned ${removed}`);
+		}
 		if (candidates.length > 1)
 			return notify(ctx, `pi-handoff: "${text}" matches ${candidates.length} pins — be more specific:\n${candidates.join("\n")}`, "warning");
 		notify(ctx, `pi-handoff: no pin matches "${text}". Current pins:\n${store.pinnedNotes().join("\n") || "(none)"}`, "warning");
@@ -994,6 +902,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 			} else candidate.status = "rejected";
 		}
 		store.saveProjectCandidates(candidates);
+		if (added > 0) injector?.invalidate();
 		status(ctx);
 		notify(ctx, `pi-handoff project review: ${added} applied, ${pending.length - approved} rejected${failed ? `, ${failed} could not be applied\n${failureReasons.join("\n")}` : ""}`);
 	}
@@ -1010,7 +919,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (!store || !text) return notify(ctx, "usage: /pi-handoff project add [Section:] <fact>", "warning");
 		const { section, statement } = parseProjectFact(text);
 		if (!statement) return notify(ctx, "pi-handoff project: fact is empty", "warning");
-		if (store.appendProjectKnowledge(section, statement)) return notify(ctx, `pi-handoff project: added under ${section}`);
+		if (store.appendProjectKnowledge(section, statement)) {
+			injector?.invalidate();
+			return notify(ctx, `pi-handoff project: added under ${section}`);
+		}
 		if (store.readProjectKnowledge().length >= PROJECT_KNOWLEDGE_CAP_CHARS)
 			return notify(ctx, "pi-handoff project: knowledge is at its 16k limit — replace or forget stale facts first", "warning");
 		notify(ctx, "pi-handoff project: already present — no change");
@@ -1019,7 +931,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 	function cmdProjectForget(ctx: Ctx, text: string): void {
 		if (!store || !text) return notify(ctx, "usage: /pi-handoff project forget <substring>", "warning");
 		const { removed, candidates } = store.removeProjectKnowledge(text);
-		if (removed) return notify(ctx, `pi-handoff project: removed ${removed}`);
+		if (removed) {
+			injector?.invalidate();
+			return notify(ctx, `pi-handoff project: removed ${removed}`);
+		}
 		if (candidates.length > 1) return notify(ctx, `pi-handoff project: ambiguous match — nothing removed:\n${candidates.join("\n")}`, "warning");
 		notify(ctx, `pi-handoff project: no knowledge matches "${text}"`, "warning");
 	}
