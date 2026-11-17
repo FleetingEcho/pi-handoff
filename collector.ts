@@ -86,8 +86,8 @@ export class Collector {
 		this.toolStartPaths.delete(toolCallId);
 	}
 
-	/** turn_end: assemble + append one redacted event. */
-	onTurnEnd(event: TurnEndEvent): HandoffEvent {
+	/** Assemble one redacted, bounded turn record. */
+	private buildTurnRecord(event: TurnEndEvent): Omit<HandoffEvent, "seq" | "schemaVersion" | "timestamp"> {
 		const excerpts: Excerpt[] = [];
 		if (event.outcome !== "completed") {
 			excerpts.push({
@@ -144,12 +144,20 @@ export class Collector {
 		const changedFiles = [...this.turnChangedFiles].slice(0, CHANGED_FILES_MAX);
 		this.turnChangedFiles.clear();
 
-		return this.store.appendEvent({
+		return {
 			sessionId: this.store.meta.sessionId,
 			turn: event.turnIndex,
 			type: "turn_end",
 			excerpts: bounded,
 			changedFiles,
-		});
+		};
+	}
+
+	onTurnEnd(event: TurnEndEvent): HandoffEvent {
+		return this.store.appendEvent(this.buildTurnRecord(event));
+	}
+
+	async onTurnEndAsync(event: TurnEndEvent): Promise<HandoffEvent> {
+		return this.store.appendEventAsync(this.buildTurnRecord(event));
 	}
 }

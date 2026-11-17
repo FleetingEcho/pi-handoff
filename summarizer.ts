@@ -71,10 +71,9 @@ async function callLlm(ctx: ModelCtx, systemPrompt: string, userText: string, ti
 				messages: [{ role: "user", content: [{ type: "text", text: userText }], timestamp: Date.now() }],
 			},
 			{
-				// Reasoning models burn thinking tokens against this cap; 8192 truncated
-				// folds on such models (finish_reason=length → missing sections → counted
-				// error). Give the call the model's output budget (capped at 32k).
-				maxTokens: Math.max(8192, Math.min(32_768, resolved.model.maxTokens ?? 8192)),
+				// Reasoning models can use their full output budget (capped at 32k),
+				// but never ask for more than the selected model advertises.
+				maxTokens: Math.min(32_768, Math.max(1, resolved.model.maxTokens ?? 8192)),
 				signal: ac.signal,
 				cacheRetention: "none",
 				sessionId: randomUUID(),
@@ -153,47 +152,41 @@ Rules:
 - Wrap the final document in <document></document> tags. No commentary outside the tags.`;
 }
 
-function serializeEvents(events: HandoffEvent[], cap = true): string {
-	const lines: string[] = [];
-	for (const ev of events) {
-		if (ev.type === "pin") {
-			lines.push(`[#${ev.seq} ${ev.timestamp}] PINNED NOTE ADDED: ${ev.note}`);
-			continue;
-		}
-		if (ev.type !== "turn_end") {
-			lines.push(`[#${ev.seq} ${ev.timestamp}] LIFECYCLE: ${ev.type}`);
-			continue;
-		}
-		lines.push(`[#${ev.seq} ${ev.timestamp}] turn ${ev.turn}`);
-		for (const e of ev.excerpts ?? []) {
-			const who = e.role === "tool" ? `TOOL(${e.toolName})` : e.role.toUpperCase();
-			lines.push(`${who}: ${e.text}`);
-		}
-		if (ev.changedFiles?.length) lines.push(`CHANGED FILES: ${ev.changedFiles.join(", ")}`);
-	}
-	let text = lines.join("\n\n");
-	if (cap && text.length > NEW_EVENTS_CAP_CHARS) {
-		const head = Math.floor(NEW_EVENTS_CAP_CHARS * 0.3);
-		const tail = NEW_EVENTS_CAP_CHARS - head;
-		text =
-			text.slice(0, head) +
-			`\n\n[... ${text.length - head - tail} chars elided ...]\n\n` +
-			text.slice(text.length - tail);
-	}
-	return text;
+function capSerializedEvents(text: string): string {
+	if (text.length <= NEW_EVENTS_CAP_CHARS) return text;
+	const head = Math.floor(NEW_EVENTS_CAP_CHARS * 0.3);
+	const tail = NEW_EVENTS_CAP_CHARS - head;
+	return text.slice(0, head) +
+		`\n\n[... ${text.length - head - tail} chars elided ...]\n\n` +
+		text.slice(text.length - tail);
 }
 
-/** Select an oldest-first, whole-event batch that fits one model call. */
-function refreshBatch(events: HandoffEvent[]): HandoffEvent[] {
+function serializeEvent(ev: HandoffEvent): string {
+	if (ev.type === "pin") return `[#${ev.seq} ${ev.timestamp}] PINNED NOTE ADDED: ${ev.note}`;
+	if (ev.type !== "turn_end") return `[#${ev.seq} ${ev.timestamp}] LIFECYCLE: ${ev.type}`;
+	const lines = [`[#${ev.seq} ${ev.timestamp}] turn ${ev.turn}`];
+	for (const e of ev.excerpts ?? []) {
+		const who = e.role === "tool" ? `TOOL(${e.toolName})` : e.role.toUpperCase();
+		lines.push(`${who}: ${e.text}`);
+	}
+	if (ev.changedFiles?.length) lines.push(`CHANGED FILES: ${ev.changedFiles.join(", ")}`);
+	return lines.join("\n\n");
+}
+
+/** Select a whole-event batch and serialize each event only once. */
+function refreshBatch(events: HandoffEvent[]): { events: HandoffEvent[]; text: string } {
 	const batch: HandoffEvent[] = [];
+	const chunks: string[] = [];
 	let chars = 0;
 	for (const event of events) {
-		const eventChars = serializeEvents([event], false).length + (batch.length ? 2 : 0);
+		const text = serializeEvent(event);
+		const eventChars = text.length + (batch.length ? 2 : 0);
 		if (batch.length > 0 && chars + eventChars > NEW_EVENTS_CAP_CHARS) break;
 		batch.push(event); // always make progress, even if one pathological event exceeds the cap
+		chunks.push(text);
 		chars += eventChars;
 	}
-	return batch;
+	return { events: batch, text: capSerializedEvents(chunks.join("\n\n")) };
 }
 
 export interface OpOutcome {
@@ -206,7 +199,7 @@ export interface OpOutcome {
 export async function runRefresh(store: HandoffStore, ctx: ModelCtx, timeoutMs: number, abortSignal?: AbortSignal): Promise<OpOutcome> {
 	const pendingEvents = store.readEventsSince(store.meta.lastRefreshedSeq).filter((e) => e.type === "turn_end" || e.type === "pin");
 	if (pendingEvents.length === 0) return { skipped: true };
-	const events = refreshBatch(pendingEvents);
+	const { events, text: serializedEvents } = refreshBatch(pendingEvents);
 
 	const sourceDocument = store.readHandoff();
 	const { body } = store.splitPinned(redact(sourceDocument));
@@ -221,7 +214,7 @@ ${body.trim() || "(empty — first refresh)"}
 </current_document>
 
 <new_events>
-${serializeEvents(events)}
+${serializedEvents}
 </new_events>
 
 Merge the new events into the handoff document.`;

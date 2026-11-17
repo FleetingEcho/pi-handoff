@@ -100,6 +100,11 @@ const WRITE_LOCK_TIMEOUT_MS = 5_000;
 const WRITE_LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_ARRAY = new Int32Array(new SharedArrayBuffer(4));
 
+/** Canonical form shared by project.md and the pin event sent to the summarizer. */
+function normalizePinnedNote(note: string): string {
+	return redact(note.replace(/\n+/g, " ").trim()).replace(/^-\s*/, "").slice(0, PIN_NOTE_MAX_CHARS).trim();
+}
+
 /**
  * On graceful shutdown, clear events.jsonl entirely once it holds at least
  * this many records — a clean slate for the next session. Below the threshold
@@ -492,6 +497,8 @@ export class HandoffStore {
 	/** # of turn_end events collected since lastRefreshedSeq — the turn-count backstop for auto-refresh (maintained on append, recomputed on load). */
 	turnsSinceRefresh = 0;
 	private heldLocks = new Map<string, number>();
+	private eventsCache: { mtimeMs: number; size: number; ino: number; events: HandoffEvent[] } | null = null;
+	private projectCandidatesCache: { mtimeMs: number; size: number; ino: number; candidates: ProjectCandidate[] } | null = null;
 
 	constructor(root: string, projectPath = "", branch = "", cwdSlug = "") {
 		this.root = root;
@@ -668,59 +675,74 @@ export class HandoffStore {
 	// ---------------------------------------------------------------- events
 
 	appendEvent(ev: Omit<HandoffEvent, "seq" | "schemaVersion" | "timestamp">): HandoffEvent {
-		return this.withBranchWriteLock(() => {
-			const disk = this.loadMeta();
-			this.meta.nextSeq = Math.max(this.meta.nextSeq, disk.nextSeq);
-			this.meta.lastCollectedSeq = Math.max(this.meta.lastCollectedSeq, disk.lastCollectedSeq);
-			this.meta.lastRefreshedSeq = Math.max(this.meta.lastRefreshedSeq, disk.lastRefreshedSeq);
-			this.meta.eventLineCount = disk.eventLineCount;
-			const full: HandoffEvent = {
-				schemaVersion: 2,
-				seq: this.meta.nextSeq++,
-				timestamp: new Date().toISOString(),
-				...ev,
-			};
-			appendFileSync(this.eventsPath, JSON.stringify(full) + "\n");
-			this.meta.eventLineCount++;
-			if (full.type === "turn_end") {
-				this.meta.lastCollectedSeq = full.seq;
-				this.pendingChars += (full.excerpts ?? []).reduce((n, e) => n + e.text.length, 0);
-				this.turnsSinceRefresh++;
+		return this.withBranchWriteLock(() => this.appendEventUnlocked(ev));
+	}
+
+	/** Async lock acquisition for turn collection: contention must not freeze Pi's event loop. */
+	async appendEventAsync(ev: Omit<HandoffEvent, "seq" | "schemaVersion" | "timestamp">): Promise<HandoffEvent> {
+		return this.withBranchWriteLockAsync(() => this.appendEventUnlocked(ev));
+	}
+
+	/** Caller holds the branch write lock. */
+	private appendEventUnlocked(ev: Omit<HandoffEvent, "seq" | "schemaVersion" | "timestamp">): HandoffEvent {
+		const disk = this.loadMeta();
+		this.meta.nextSeq = Math.max(this.meta.nextSeq, disk.nextSeq);
+		this.meta.lastCollectedSeq = Math.max(this.meta.lastCollectedSeq, disk.lastCollectedSeq);
+		this.meta.lastRefreshedSeq = Math.max(this.meta.lastRefreshedSeq, disk.lastRefreshedSeq);
+		this.meta.eventLineCount = disk.eventLineCount;
+		const full: HandoffEvent = {
+			schemaVersion: 2,
+			seq: this.meta.nextSeq++,
+			timestamp: new Date().toISOString(),
+			...ev,
+		};
+		appendFileSync(this.eventsPath, JSON.stringify(full) + "\n");
+		this.meta.eventLineCount++;
+		if (full.type === "turn_end") {
+			this.meta.lastCollectedSeq = full.seq;
+			this.pendingChars += (full.excerpts ?? []).reduce((n, e) => n + e.text.length, 0);
+			this.turnsSinceRefresh++;
+		}
+		this.maybeTrimEvents();
+		this.saveMetaUnlocked();
+		return full;
+	}
+
+	/** Parse only when the log changed; callers treat the shared parsed events as read-only. */
+	private readAllEvents(): HandoffEvent[] {
+		try {
+			const stat = statSync(this.eventsPath);
+			const hit = this.eventsCache;
+			if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size && hit.ino === stat.ino) return hit.events;
+			const events: HandoffEvent[] = [];
+			for (const line of this.readSafe(this.eventsPath).split("\n")) {
+				if (!line.trim()) continue;
+				try {
+					const event = JSON.parse(line) as unknown;
+					if (event && typeof event === "object" && !Array.isArray(event)) events.push(event as HandoffEvent);
+				} catch {
+					// Malformed line (interrupted write) — ignore and continue.
+				}
 			}
-			this.maybeTrimEvents();
-			this.saveMetaUnlocked();
-			return full;
-		});
+			this.eventsCache = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, events };
+			return events;
+		} catch {
+			return [];
+		}
 	}
 
 	/** All events with seq > afterSeq, tolerating a malformed tail line (crash during append). */
 	readEventsSince(afterSeq: number): HandoffEvent[] {
-		const out: HandoffEvent[] = [];
-		for (const line of this.readSafe(this.eventsPath).split("\n")) {
-			if (!line.trim()) continue;
-			try {
-				const ev = JSON.parse(line) as HandoffEvent;
-				if (typeof ev.seq === "number" && ev.seq > afterSeq) out.push(ev);
-			} catch {
-				// malformed line (interrupted write) — ignore and continue
-			}
-		}
-		return out;
+		return this.readAllEvents().filter((event) => typeof event.seq === "number" && event.seq > afterSeq);
 	}
 
 	/** Previous versions of handoff.md, newest first — the replacement for history/. */
 	readSnapshots(limit = 10): Array<{ seq: number; timestamp: string; doc: string }> {
-		const out: Array<{ seq: number; timestamp: string; doc: string }> = [];
-		for (const line of this.readSafe(this.eventsPath).split("\n")) {
-			if (!line.includes('"snapshot"')) continue; // cheap pre-filter
-			try {
-				const ev = JSON.parse(line) as HandoffEvent;
-				if (ev.type === "snapshot" && ev.doc) out.push({ seq: ev.seq, timestamp: ev.timestamp, doc: ev.doc });
-			} catch {
-				// ignore
-			}
-		}
-		return out.reverse().slice(0, limit);
+		return this.readAllEvents()
+			.filter((event) => event.type === "snapshot" && event.doc)
+			.map((event) => ({ seq: event.seq, timestamp: event.timestamp, doc: event.doc! }))
+			.reverse()
+			.slice(0, limit);
 	}
 
 	markRefreshed(throughSeq: number): void {
@@ -940,7 +962,7 @@ export class HandoffStore {
 	 * is already pinned — re-noticing the same fact must not grow the file. */
 	appendPinned(note: string): boolean {
 		return this.withProjectWriteLock(() => {
-			const clean = redact(note.replace(/\n+/g, " ").trim()).replace(/^-\s*/, "").slice(0, PIN_NOTE_MAX_CHARS).trim();
+			const clean = normalizePinnedNote(note);
 			if (!clean) return false;
 			const norm = (s: string) => s.replace(/^-\s*/, "").trim().toLowerCase();
 			const pins = this.pinnedNotes();
@@ -1033,13 +1055,30 @@ export class HandoffStore {
 		});
 	}
 
-	readProjectCandidates(): ProjectCandidate[] {
+	private readProjectCandidatesCached(): ProjectCandidate[] {
 		try {
+			const stat = statSync(this.projectCandidatesPath);
+			const hit = this.projectCandidatesCache;
+			if (hit && hit.mtimeMs === stat.mtimeMs && hit.size === stat.size && hit.ino === stat.ino) return hit.candidates;
 			const parsed = JSON.parse(this.readSafe(this.projectCandidatesPath));
-			return Array.isArray(parsed) ? parsed.map(normalizeProjectCandidate).filter((candidate): candidate is ProjectCandidate => candidate !== null) : [];
+			const candidates = Array.isArray(parsed)
+				? parsed.map(normalizeProjectCandidate).filter((candidate): candidate is ProjectCandidate => candidate !== null)
+				: [];
+			this.projectCandidatesCache = { mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, candidates };
+			return candidates;
 		} catch {
 			return [];
 		}
+	}
+
+	/** Return copies because command/review code mutates candidates before saving them. */
+	readProjectCandidates(): ProjectCandidate[] {
+		return this.readProjectCandidatesCached().map((candidate) => ({ ...candidate, branches: [...candidate.branches] }));
+	}
+
+	/** Cheap status-bar path: no per-turn JSON parsing or candidate cloning. */
+	suggestedProjectCandidateCount(): number {
+		return this.readProjectCandidatesCached().reduce((count, candidate) => count + (candidate.status === "suggested" ? 1 : 0), 0);
 	}
 
 	saveProjectCandidates(candidates: ProjectCandidate[]): void {
@@ -1156,6 +1195,45 @@ export class HandoffStore {
 		return this.withWriteLock(join(dirname(this.root), ".project-write-lock"), fn);
 	}
 
+	private async withBranchWriteLockAsync<T>(fn: () => T): Promise<T> {
+		return this.withWriteLockAsync(join(this.root, ".write-lock"), fn);
+	}
+
+	/** Same lock protocol as withWriteLock, but yields to the event loop between attempts. */
+	private async withWriteLockAsync<T>(lockPath: string, fn: () => T): Promise<T> {
+		const depth = this.heldLocks.get(lockPath) ?? 0;
+		if (depth > 0) {
+			this.heldLocks.set(lockPath, depth + 1);
+			try { return fn(); } finally { this.heldLocks.set(lockPath, depth); }
+		}
+		const deadline = Date.now() + WRITE_LOCK_TIMEOUT_MS;
+		while (true) {
+			try {
+				mkdirSync(lockPath);
+				break;
+			} catch (error: any) {
+				if (error?.code !== "EEXIST") throw error;
+				try {
+					if (Date.now() - statSync(lockPath).mtimeMs > WRITE_LOCK_STALE_MS) {
+						rmdirSync(lockPath);
+						continue;
+					}
+				} catch {
+					continue; // lock disappeared between checks
+				}
+				if (Date.now() >= deadline) throw new Error(`pi-handoff: timed out waiting for write lock ${lockPath}`);
+				await new Promise<void>((resolve) => setTimeout(resolve, 20));
+			}
+		}
+		this.heldLocks.set(lockPath, 1);
+		try {
+			return fn();
+		} finally {
+			this.heldLocks.delete(lockPath);
+			try { rmdirSync(lockPath); } catch { /* stale-lock recovery may have raced; next operation retries */ }
+		}
+	}
+
 	private withWriteLock<T>(lockPath: string, fn: () => T): T {
 		const depth = this.heldLocks.get(lockPath) ?? 0;
 		if (depth > 0) {
@@ -1221,6 +1299,14 @@ export class HandoffStore {
 			.trim();
 		return body.length >= 24;
 	}
+}
+
+/** Persist a pin and its refresh event from the same redacted value. */
+export function recordPinnedNote(store: HandoffStore, note: string): boolean {
+	const clean = normalizePinnedNote(note);
+	if (!clean || !store.appendPinned(clean)) return false;
+	store.appendEvent({ sessionId: store.meta.sessionId, turn: -1, type: "pin", note: clean });
+	return true;
 }
 
 function seqOf(line: string): number | null {

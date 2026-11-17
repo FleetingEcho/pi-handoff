@@ -1,6 +1,6 @@
 # pi-handoff
 
-Persistent working memory for [pi](https://github.com/badlogic/pi-mono): one automatically maintained handoff per git branch, plus shared project knowledge available on every branch.
+Persistent working memory for [pi](https://github.com/earendil-works/pi): one automatically maintained handoff per git branch, plus shared project knowledge available on every branch.
 
 The extension records recent turns, periodically folds them into concise Markdown, and injects the result into future sessions. Nothing is written into your repository.
 
@@ -34,7 +34,7 @@ Each git branch has an independent `handoff.md`. Switching branches switches han
 
 ## Everyday use
 
-Normally, just work. A background refresh runs roughly every three turns, sooner when a large amount of material accumulates, and before context compaction. Buffered events are durable, so quitting does not need to wait for a model call.
+Normally, just work. By default, a background refresh runs every 20 turns or after about 24,000 new excerpt characters, whichever comes first; tune these with `PI_HANDOFF_THRESHOLD_TURNS` and `PI_HANDOFF_THRESHOLD_CHARS`. Compaction schedules a refresh afterward without blocking pi. Buffered events are durable, so quitting does not need to wait for a model call.
 
 ```bash
 /pi-handoff status       # paths, pending events, usage, and project suggestions
@@ -117,6 +117,7 @@ Do not pin current task progress, branch-specific state, duplicated documentatio
 | Command | Purpose |
 |---|---|
 | `/pi-handoff [status]` | Show store, branch, queue, usage, pins, and project suggestions |
+| `/pi-handoff help` | Show the complete command reference |
 | `/pi-handoff flush` | Refresh the current branch handoff now |
 | `/pi-handoff clear` | Start a fresh task handoff; project knowledge and pins remain |
 | `/pi-handoff project status` | Show shared knowledge and pending suggestions |
@@ -157,7 +158,7 @@ Shared project knowledge is capped at roughly 16,000 characters because it is in
 
 | File/content | Limit | Cleanup behavior |
 |---|---:|---|
-| `handoff.md` | 24k characters / 96 KB | Oversized model output is compacted by section; oversized writes are rejected |
+| `handoff.md` | 16k characters / 96 KB | Oversized model output is compacted by section; oversized writes are rejected |
 | Project knowledge | 16k characters | Existing oversized sections are compacted; new facts are rejected at the limit |
 | Pinned rules | 200 rules, 500 characters each, 16k total | New pins are rejected; legacy duplicate/overflow pins are removed with a marker |
 | `project.md` | 128 KB | Enforced on every atomic write |
@@ -170,7 +171,7 @@ A collected turn contributes at most about 12k excerpt characters and 200 change
 
 ## Reliability and privacy
 
-- Events are appended synchronously before background summarization.
+- Turn records are durably appended before background summarization; lock waits yield to pi's event loop.
 - Compaction never waits for the handoff summarizer; durable events refresh in the background after compaction.
 - Background model calls use pi's model registry, so OAuth, cloud credentials, custom providers, and virtual models work the same way as the active session.
 - Document and metadata replacements use unique temporary files plus atomic rename.
@@ -189,7 +190,7 @@ Two sessions on different branches are isolated. Sessions on the same branch coo
 
 **The handoff is not updating.** Check `/pi-handoff status`. A small pending buffer is normal. If refreshes fail, run with `PI_HANDOFF_DEBUG=1`; authentication is inherited from the active pi model.
 
-**Quitting did not refresh.** This is intentional. In-flight work is aborted promptly, while buffered events remain in `events.jsonl` and are folded during a later session.
+**Quitting did not refresh.** This is intentional. Pending collector writes are drained within the bounded filesystem-lock wait, while in-flight summarizer calls are aborted promptly. Buffered events remain in `events.jsonl` and are folded during a later session.
 
 **The content is stale or wrong.** Edit the Markdown directly, run `/pi-handoff clear` for a new task, or use `project forget` for incorrect shared knowledge. Pin only corrections that must remain permanent.
 
@@ -202,11 +203,12 @@ grep '"snapshot"' /path/to/events.jsonl | tail -1 | jq -r .doc
 ## Development
 
 ```bash
-npm install
-npm run typecheck
+bun install
+bun test
+bun run typecheck
 ```
 
-The pi runtime packages are optional peer dependencies: pi resolves them when loading the extension without installing a second runtime copy. For local type checking, make those package types available from the installed pi runtime or install them temporarily without saving.
+The pi runtime packages remain optional peer dependencies for runtime installations. Development-only copies provide the exact Pi 1.5.2 API types and test runtime; they are not installed when pi manages this package.
 
 Main files:
 
@@ -215,6 +217,8 @@ Main files:
 | `index.ts` | Lifecycle, refresh queue, commands, and agent tool |
 | `store.ts` | Paths, migrations, project knowledge, events, and atomic persistence |
 | `collector.ts` | Deterministic redacted turn collection |
+| `command.ts` | Empty-command defaults, help text, and nested completion |
+| `git.ts` | Fast repository and branch discovery |
 | `summarizer.ts` | Branch refresh and project-knowledge extraction |
 | `injector.ts` | Branch and project context injection |
 | `redact.ts` | Secret denylist |

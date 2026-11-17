@@ -45,10 +45,11 @@ import { StringEnum } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionCommandContext, type ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { Collector } from "./collector";
+import { completeHandoffArguments, HANDOFF_HELP, parseHandoffArguments } from "./command";
 import { activeGitBranches, detectBranch, resolveProjectRoot } from "./git";
 import { Injector } from "./injector";
 import { redact } from "./redact";
-import { HandoffStore, PROJECT_KNOWLEDGE_CAP_CHARS, PROJECT_SECTIONS, listBranchDocs, migrateProjectKey, orphanSubdirStores, storeHome, type ProjectCandidate, type ProjectSection } from "./store";
+import { HandoffStore, PROJECT_KNOWLEDGE_CAP_CHARS, PROJECT_SECTIONS, listBranchDocs, migrateProjectKey, orphanSubdirStores, recordPinnedNote, storeHome, type ProjectCandidate, type ProjectSection } from "./store";
 import { runProjectExtraction, runRefresh } from "./summarizer";
 
 /** Character ceiling: force an early refresh once this many new chars accumulate,
@@ -130,6 +131,8 @@ export default function piHandoff(pi: ExtensionAPI) {
 	let suggestionCache: { path: string; mtimeMs: number; size: number; ino: number; count: number } | null = null;
 	/** AbortController for the currently-running drain; aborted on shutdown or a branch switch. */
 	let activeAbort: AbortController | null = null;
+	/** Durable turn appends tracked separately so shutdown cannot outrun a contested lock. */
+	const collectorWrites = new Set<Promise<unknown>>();
 
 	const debug = (msg: string) => {
 		if (process.env.PI_HANDOFF_DEBUG) console.error(`[pi-handoff] ${msg}`);
@@ -151,7 +154,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 		try {
 			const stat = statSync(s.projectCandidatesPath);
 			if (suggestionCache?.path === s.projectCandidatesPath && suggestionCache.mtimeMs === stat.mtimeMs && suggestionCache.size === stat.size && suggestionCache.ino === stat.ino) return suggestionCache.count;
-			const count = s.readProjectCandidates().filter((candidate) => candidate.status === "suggested").length;
+			const count = s.suggestedProjectCandidateCount();
 			suggestionCache = { path: s.projectCandidatesPath, mtimeMs: stat.mtimeMs, size: stat.size, ino: stat.ino, count };
 			return count;
 		} catch {
@@ -368,8 +371,14 @@ export default function piHandoff(pi: ExtensionAPI) {
 	pi.on("turn_end", async (event, ctx) => {
 		try {
 			if (!collector || !recording()) return;
-			collector.onTurnEnd(event);
-			status(ctx);
+			const pending = collector.onTurnEndAsync(event);
+			collectorWrites.add(pending);
+			try {
+				await pending;
+				status(ctx);
+			} finally {
+				collectorWrites.delete(pending);
+			}
 		} catch (e) {
 			debug(String(e));
 		}
@@ -386,8 +395,8 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("session_compact", async (_event, ctx) => {
 		try {
-			// Events were already appended synchronously at turn_end, and Pi's own
-			// compaction summary preserves the live conversation. Refresh only after
+			// Pi awaits turn_end handlers before agent_settled, so turn records are
+			// durable. Its compaction summary preserves the live conversation. Refresh only after
 			// compaction and do it in the background: the old implementation blocked
 			// /compact and overflow recovery on another model call for up to 120s.
 			injector?.invalidate();
@@ -401,6 +410,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	pi.on("session_shutdown", async () => {
 		try {
+			// A collector waiting on another process's lock has yielded to the event
+			// loop, so shutdown must explicitly drain it. The lock wait is bounded by
+			// WRITE_LOCK_TIMEOUT_MS; no model call or unbounded wait is introduced.
+			await Promise.allSettled([...collectorWrites]);
 			// Mark this session as ended gracefully so the next session_start (a
 			// fast restart, or an in-process /new, /resume, /fork, /reload) doesn't
 			// mistake itself for a concurrent writer. Best-effort: a crash skips
@@ -409,8 +422,8 @@ export default function piHandoff(pi: ExtensionAPI) {
 				store.meta.endedAt = new Date().toISOString();
 				store.saveMetaSync();
 			}
-			// Events are durable in events.jsonl (appended synchronously by the
-			// collector on turn_end) and pendingChars is recomputed from
+			// Events are durable in events.jsonl after the collector drain above,
+			// and pendingChars is recomputed from
 			// lastRefreshedSeq on the next session_start. Not flushing at shutdown
 			// loses nothing — the next session picks up the un-folded events and
 			// refreshes them. Blocking exit on a full LLM refresh is what made
@@ -420,7 +433,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 			if (activeAbort) activeAbort.abort(new Error("pi-handoff: shutdown"));
 			if (inFlight) await Promise.race([inFlight, sleep(SHUTDOWN_GRACE_MS)]);
 			// Drop the event log for a clean slate next session if it grew large.
-			// Below EVENTS_EXIT_CLEAR_LINES (default 500) it's kept so recent snapshot
+			// Below EVENTS_EXIT_CLEAR_LINES (default 0/off) it's kept so recent snapshot
 			// history survives across restarts; at/above the threshold we wipe it —
 			// an accepted tradeoff that also discards older snapshots, so recovering
 			// a prior handoff returns nothing after such a restart.
@@ -627,8 +640,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 					}
 					case "pin": {
 						if (!params.note?.trim()) return txt("handoff: action=pin requires a 'note'");
-						if (!s.appendPinned(params.note)) return txt(`pi-handoff: already pinned — no change. Current pins:\n${s.pinnedNotes().join("\n") || "(none)"}`);
-						s.appendEvent({ sessionId: s.meta.sessionId, turn: -1, type: "pin", note: params.note });
+						if (!recordPinnedNote(s, params.note)) return txt(`pi-handoff: already pinned — no change. Current pins:\n${s.pinnedNotes().join("\n") || "(none)"}`);
 						injector?.invalidate();
 						return txt(`Pinned to ${s.projectDocPath} — applies on every branch of this project and is visible to other agents sharing this store. It appears in context from the next request on.`);
 					}
@@ -668,23 +680,11 @@ export default function piHandoff(pi: ExtensionAPI) {
 
 	// ------------------------------------------------------------- commands
 
-	const SUBCOMMANDS = [
-		["status", "Show handoff statistics"],
-		["flush", "Force a handoff.md refresh now"],
-		["pin", "Record a standing project rule (applies on every branch)"],
-		["unpin", "Remove a pinned rule by substring match"],
-		["project", "Manage project-wide knowledge (status|refresh|review|add|forget)"],
-		["clear", "Start a fresh handoff for a new task (pins are kept)"],
-		["pause", "Stop recording for this session (the gap is never written)"],
-		["resume", "Start recording again"],
-	] as const;
-
 	pi.registerCommand("pi-handoff", {
 		description: "pi-handoff: branch handoff + shared project knowledge (status|flush|project|pin|unpin|clear|pause|resume)",
-		getArgumentCompletions: (prefix: string) =>
-			SUBCOMMANDS.filter(([name]) => name.startsWith(prefix)).map(([value, label]) => ({ value, label })),
+		getArgumentCompletions: completeHandoffArguments,
 		handler: async (args, ctx: ExtensionCommandContext) => {
-			const [sub = "status", ...rest] = args.trim().split(/\s+/);
+			const { sub, rest } = parseHandoffArguments(args);
 			const text = rest.join(" ");
 			try {
 				switch (sub) {
@@ -704,8 +704,10 @@ export default function piHandoff(pi: ExtensionAPI) {
 						return cmdPause(ctx);
 					case "resume":
 						return cmdResume(ctx);
+					case "help":
+						return notify(ctx, HANDOFF_HELP);
 					default:
-						notify(ctx, `pi-handoff: unknown subcommand "${sub}" — try status|flush|pin|unpin|project|clear|pause|resume`, "error");
+						notify(ctx, `pi-handoff: unknown subcommand "${sub}" — run /pi-handoff help`, "error");
 				}
 			} catch (e) {
 				notify(ctx, `pi-handoff ${sub} failed: ${e instanceof Error ? e.message : e}`, "error");
@@ -718,7 +720,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 		if (!store) return null;
 		const m = store.meta;
 		const project = store.parseProjectDoc(store.readProjectDoc());
-		const suggestions = store.readProjectCandidates().filter((candidate) => candidate.status === "suggested").length;
+		const suggestions = store.suggestedProjectCandidateCount();
 		return [
 			`pi-handoff — store: ${store.root}`,
 			`  branch: ${currentBranch}`,
@@ -753,8 +755,7 @@ export default function piHandoff(pi: ExtensionAPI) {
 	function cmdPin(ctx: Ctx, text: string): void {
 		if (!store) return;
 		if (!text) return notify(ctx, "usage: /pi-handoff pin <note>", "warning");
-		if (!store.appendPinned(text)) return notify(ctx, "pi-handoff: already pinned — no change");
-		store.appendEvent({ sessionId: store.meta.sessionId, turn: -1, type: "pin", note: text });
+		if (!recordPinnedNote(store, text)) return notify(ctx, "pi-handoff: already pinned — no change");
 		injector?.invalidate();
 		notify(ctx, `pi-handoff: pinned to ${store.projectDocPath} — applies on every branch of this project`);
 	}

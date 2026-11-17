@@ -1,5 +1,26 @@
 # Changelog
 
+## [Unreleased]
+
+### Added
+
+- Working `/pi-handoff` default status, a `help` command, and nested project-command completion.
+- Regression tests for pin privacy, model output limits, lock contention, candidate caches, and command parsing.
+- Reproducible local tests and type checks with Pi 1.5.2 development-only dependencies.
+
+### Changed
+
+- Cache parsed event logs and project candidates by file identity while retaining mutation-safe copies for callers.
+- Yield to pi's event loop while turn collection waits for a contested write lock.
+- Serialize each event once when selecting a background-refresh batch.
+
+### Fixed
+
+- Use the same redacted pin in `project.md` and `events.jsonl`, preventing raw pins from reaching later model calls.
+- Never request more output tokens than the selected model supports.
+- Correct documentation for refresh thresholds, compaction timing, and document limits.
+- Drain pending collector writes during shutdown and tolerate non-object JSONL records during startup.
+
 ## [0.12.0] - 2026-11-17
 
 ### Added

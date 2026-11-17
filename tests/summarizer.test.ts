@@ -12,7 +12,7 @@ afterEach(() => {
 });
 
 describe("pi 1.5 model runtime integration", () => {
-	test("uses ModelRegistry.complete as a standalone request", async () => {
+	test("uses ModelRegistry.complete as a standalone request within the model output budget", async () => {
 		const parent = mkdtempSync(join(tmpdir(), "pi-handoff-model-"));
 		roots.push(parent);
 		const store = new HandoffStore(join(parent, "main"), parent, "main", "test");
@@ -28,7 +28,7 @@ describe("pi 1.5 model runtime integration", () => {
 		const document = HANDOFF_SECTIONS.map((section) => `# ${section}\n- updated`).join("\n\n");
 		let requestOptions: Record<string, unknown> | undefined;
 		let calls = 0;
-		const model = { provider: "test", id: "model", name: "Model", maxTokens: 16_384 };
+		const model = { provider: "test", id: "model", name: "Model", maxTokens: 4_096 };
 		const ctx = {
 			model,
 			modelRegistry: {
@@ -50,6 +50,7 @@ describe("pi 1.5 model runtime integration", () => {
 		expect(calls).toBe(1);
 		expect(requestOptions?.disableContinuation).toBe(true);
 		expect(requestOptions?.cacheRetention).toBe("none");
+		expect(requestOptions?.maxTokens).toBe(4_096);
 		expect(result.remaining).toBe(false);
 		expect(store.readHandoff()).toContain("# Next Steps\n- updated");
 		expect(store.meta.lastRefreshedSeq).toBe(1);

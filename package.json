@@ -22,7 +22,7 @@
     "@earendil-works/pi-ai": "*",
     "@earendil-works/pi-coding-agent": "*"
   },
-  "//peerDependenciesMeta": "Optional so `npm install` does NOT pull a second copy of the pi runtime into the extension clone. Imports are resolved at runtime by pi (jiti) from the installed pi, never from here.",
+  "//peerDependenciesMeta": "Optional peers keep runtime installations on pi's host runtime. Development copies only provide local test and type-check dependencies.",
   "peerDependenciesMeta": {
     "@earendil-works/pi-ai": {
       "optional": true
@@ -36,6 +36,8 @@
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "1.5.2",
+    "@earendil-works/pi-coding-agent": "1.5.2",
     "@types/node": "^24.0.0",
     "typebox": "^1.3.0",
     "typescript": "^5.9.0"
