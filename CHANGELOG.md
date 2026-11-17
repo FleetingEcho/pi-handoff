@@ -20,6 +20,7 @@
 - Never request more output tokens than the selected model supports.
 - Correct documentation for refresh thresholds, compaction timing, and document limits.
 - Drain pending collector writes during shutdown and tolerate non-object JSONL records during startup.
+- Preserve legacy or manually edited knowledge when shared with OpenCode while adding missing project section headings.
 
 ## [0.12.0] - 2026-11-17
 

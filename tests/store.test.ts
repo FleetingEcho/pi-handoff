@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { HandoffStore, recordPinnedNote } from "../store";
+import { HandoffStore, PROJECT_SECTIONS, recordPinnedNote } from "../store";
 
 const roots: string[] = [];
 
@@ -106,6 +106,15 @@ describe("pinned note recording", () => {
 		expect(() => store.initSync()).not.toThrow();
 		expect(store.readEventsSince(-1).map((event) => event.seq)).toEqual([7]);
 		expect(store.readSnapshots()[0]?.doc).toBe("recovered");
+	});
+
+	test("preserves partial project knowledge while adding missing sections", () => {
+		const store = tempStore();
+		writeFileSync(store.projectDocPath, "# Architecture\n- Keep this shared fact\n\n# Pinned Rules\n\n- Keep this pin\n");
+		store.initSync();
+		expect(store.readProjectKnowledge()).toContain("Keep this shared fact");
+		expect(store.pinnedNotes()).toEqual(["- Keep this pin"]);
+		for (const section of PROJECT_SECTIONS) expect(store.readProjectDoc()).toContain(`# ${section}`);
 	});
 
 	test("keeps cached candidate status isolated from mutable command results", () => {

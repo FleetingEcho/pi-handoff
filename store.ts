@@ -897,10 +897,13 @@ export class HandoffStore {
 	private ensureProjectLayout(): void {
 		const current = this.readProjectDoc();
 		const { body, pinned } = this.splitPinned(current);
-		const hasManagedSections = PROJECT_SECTIONS.every((s) => new RegExp(`^# ${s}\\s*$`, "m").test(body));
-		const managed = this.fitProjectKnowledge(
-			hasManagedSections ? body.trimEnd() : PROJECT_SECTIONS.map((s) => `# ${s}\n`).join("\n").trimEnd(),
-		);
+		// Preserve legacy/manual knowledge: add only missing headings instead of
+		// replacing a partially structured document with an empty skeleton.
+		let managedBody = body.trimEnd() || PROJECT_SECTIONS.map((s) => `# ${s}\n`).join("\n").trimEnd();
+		for (const section of PROJECT_SECTIONS) {
+			if (!new RegExp(`^# ${section}\\s*$`, "m").test(managedBody)) managedBody = `${managedBody}\n\n# ${section}\n`.trimEnd();
+		}
+		const managed = this.fitProjectKnowledge(managedBody);
 		const protectedPins = this.fitPinnedBlock(pinned ?? (current || DEFAULT_PINNED));
 		this.atomicWriteSync(this.projectDocPath, `${managed}\n\n${protectedPins}\n`);
 	}
